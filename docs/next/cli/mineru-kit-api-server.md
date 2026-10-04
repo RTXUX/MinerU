@@ -12,6 +12,8 @@
 
 `mineru doclib` 可以通过 HTTP 调用它执行解析任务。
 
+本地服务另提供同步 multipart `POST /file_parse` 基础兼容适配器，复用 V1 鉴权、并发限制及任务执行。该入口兼容旧响应外壳，输出文档仍使用当前协议；不恢复 `/tasks`，也不扩展 V1 Router。字段、backend 到 tier 的映射及限制见 [HTTP API](../../zh/usage/http_api.md#旧版-multipart-适配器)。适配器省略 backend/tier 时使用服务启动 tier（包括 Flash）；下文 V1 默认 tier 规则保持不变。
+
 ## 2. 与 doclib 的协作
 
 ```text

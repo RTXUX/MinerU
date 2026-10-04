@@ -14,7 +14,7 @@
 
 ??? question "升级后旧命令、API 或配置不再工作怎么办？"
 
-    4.0 WebUI 使用 `mineru-kit webui` / `mineru-webui`，解析 API 使用 `/v1/*`，配置使用 `config.yaml`。旧 `/file_parse`、`/tasks` 和 `model.stack` 不能直接沿用。见[迁移指南](../reference/migration_4.md)。
+    4.0 WebUI 使用 `mineru-kit webui` / `mineru-webui`，解析 API 使用 `/v1/*`，配置使用 `config.yaml`。本地服务提供使用当前输出协议的[基础 `/file_parse` 适配器](../usage/http_api.md#旧版-multipart-适配器)，`/tasks` 和 `model.stack` 仍不支持。见[迁移指南](../reference/migration_4.md)。
 
 ??? question "在WSL2的Ubuntu22.04中遇到报错`ImportError: libGL.so.1: cannot open shared object file: No such file or directory`"
 

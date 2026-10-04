@@ -60,4 +60,33 @@ Downloads go through `GET /v1/files/{file_id}/content`, which may answer with a 
 - `--concurrency` caps concurrent parse jobs; queue growth beyond it shows up as longer `queued` times, not failures.
 - `GET /v1/usage` reports consumption. Use `/v1/health` and the OpenAPI docs at `/docs` (when enabled) to separate service-side failures from client errors; check server logs before retrying a `failed` job.
 
-The V1 service does not provide legacy `/file_parse` or `/tasks` routes; see [migration](../reference/migration_4.md) for older clients.
+## Legacy multipart adapter
+
+The local parse server (`mineru-kit api-server` / `mineru-api`) also accepts synchronous `POST /file_parse` requests:
+
+```bash
+curl http://127.0.0.1:8000/file_parse \
+  -F 'files=@document.pdf' \
+  -F 'parse_method=auto' \
+  -F 'return_md=true'
+```
+
+Repeat `files` for multiple uploads. When configured, the same `Authorization: Bearer ...` header as V1 is required. The response is `{"backend":"hybrid-auto-engine","version":"...","results":{"document":{"md_content":"..."}}}`. Duplicate filename stems receive numeric suffixes. Parsing failures return HTTP 409; invalid options return 400. Uploads are limited to 100 files and 200 MiB per file.
+
+Supported options:
+
+| Field | Behavior |
+| --- | --- |
+| `parse_method` | `auto` (default), `txt`, or `ocr` |
+| `start_page_id`, `end_page_id` | Zero-based, inclusive PDF range; defaults `0`, `99999`. Non-PDF native formats are parsed whole. |
+| `return_md` | Default `true`; returns `md_content` |
+| `return_middle_json`, `return_model_output`, `return_content_list` | Default `false`; return JSON **strings**, as in the old envelope. Model output is `null` if unavailable. |
+| `return_images` | Default `false`; returns an `images` map from filename to base64 data URL |
+| `response_format_zip` | Default `false`; returns `results.zip` with selected outputs under `<stem>/<parse_method>/` |
+| `return_original_file` | Include the uploaded bytes in ZIP output as `<stem>_origin.<extension>` |
+| `backend` | `pipeline` maps to Basic; `hybrid-*` and `vlm-*` (`auto-engine` or `http-client`) map to Standard; `flash` maps to Flash. Omission uses the server's startup tier. |
+| `tier` | Optional current tier; overrides the backend mapping, subject to server availability |
+
+This adapter preserves the transport envelope, **not the old document schema or inference engines**. Middle JSON and model output use current schemas; content lists use the current Content List V1 renderer. The response `backend` echoes the supplied legacy label, or `hybrid-auto-engine` when omitted; it does not identify the actual engine. Legacy `lang_list`, `formula_enable`, `table_enable`, and `image_analysis` fields are accepted but ignored in favor of current parsing and server configuration. A non-empty `server_url` and `client_side_output_generation=true` are rejected; configure VLM connections on the server.
+
+Calls share V1 concurrency and model lifecycle management. Adapter uploads, artifacts, and job records are temporary and removed after each call. The adapter is local-server only: the V1 router continues to expose V1 routes only, and `/tasks` is not restored. New clients should use V1; see [migration](../reference/migration_4.md).

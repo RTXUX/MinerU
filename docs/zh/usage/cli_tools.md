@@ -64,7 +64,7 @@ mineru-kit parse ./documents -o ./output --format zip
 mineru-kit api-server --host 127.0.0.1 --port 8000 --tier standard
 ```
 
-在浏览器打开 `http://127.0.0.1:8000/docs` 查看自动生成的 OpenAPI 文档。当前服务接口统一位于 `/v1/*`；已删除的 `/file_parse` 和 `/tasks` 不再提供。
+在浏览器打开 `http://127.0.0.1:8000/docs` 查看自动生成的 OpenAPI 文档。主要接口位于 `/v1/*`；本地解析服务另提供[基础 `/file_parse` 适配器](http_api.md#旧版-multipart-适配器)，`/tasks` 不恢复。
 
 ### Gradio WebUI
 

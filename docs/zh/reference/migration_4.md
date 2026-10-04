@@ -60,7 +60,7 @@ model:
 
 ## API 与 WebUI
 
-V1 API 使用 `/v1/health`、`/v1/tiers`、`/v1/uploads`、`/v1/parse/jobs` 和 `/v1/files`；旧 `/file_parse`、`/tasks` 不再提供。SDK 客户端和 WebUI 必须连接 V1 服务。文档解析 API 与 OpenAI 兼容 VLM 服务是不同接口，地址不可互换。
+V1 API 使用 `/v1/health`、`/v1/tiers`、`/v1/uploads`、`/v1/parse/jobs` 和 `/v1/files`。本地解析服务另提供[基础 `/file_parse` 适配器](../usage/http_api.md#旧版-multipart-适配器)，支持 multipart 上传和同步响应，文档数据使用当前协议。`/tasks` 不恢复，V1 Router 不提供此适配器。SDK 客户端和 WebUI 必须连接 V1 服务。文档解析 API 与 OpenAI 兼容 VLM 服务是不同接口，地址不可互换。
 
 原 Gradio 客户端也需按新版事件接口调整，不能仅替换命令名称。第三方插件的旧适配文档保留历史说明，不表示已支持 V1 API。
 

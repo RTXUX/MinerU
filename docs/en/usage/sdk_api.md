@@ -94,4 +94,4 @@ When throughput matters, check the service logs and `GET /v1/usage`. See [Tiers 
 
 The same upload → job → poll → download cycle can be driven with plain HTTP calls. The [V1 HTTP API walkthrough](http_api.md) provides a complete curl example covering upload completion, terminal states (including `partial`), resuming after a client timeout, and artifact downloads.
 
-The 4.0 V1 service does not provide legacy `/file_parse` or `/tasks` routes. See [migration](../reference/migration_4.md) for older clients and [output formats](../reference/output_files.md) for rendering and saving Python results.
+The local parse server provides a [basic `/file_parse` adapter](http_api.md#legacy-multipart-adapter); `/tasks` remains unavailable. See [migration](../reference/migration_4.md) for older clients and [output formats](../reference/output_files.md) for rendering and saving Python results.

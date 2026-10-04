@@ -60,7 +60,7 @@ Restart relevant services after configuration changes, and download and verify m
 
 ## API and WebUI
 
-V1 uses `/v1/health`, `/v1/tiers`, `/v1/uploads`, `/v1/parse/jobs`, and `/v1/files`. Legacy `/file_parse` and `/tasks` are not provided. SDK clients and the WebUI must connect to a V1 service. The parsing API and OpenAI-compatible VLM server are different interfaces; their addresses are not interchangeable.
+V1 uses `/v1/health`, `/v1/tiers`, `/v1/uploads`, `/v1/parse/jobs`, and `/v1/files`. The local parse server also provides a [basic `/file_parse` adapter](../usage/http_api.md#legacy-multipart-adapter) for multipart uploads and synchronous responses, using current document schemas. `/tasks` is not provided, and the V1 router has no legacy adapter. SDK clients and the WebUI must connect to a V1 service. The parsing API and OpenAI-compatible VLM server are different interfaces; their addresses are not interchangeable.
 
 Existing Gradio clients also need to follow the new event interface; renaming the command alone is insufficient. Retained third-party integration guides describe their original adaptations and do not imply V1 compatibility.
 

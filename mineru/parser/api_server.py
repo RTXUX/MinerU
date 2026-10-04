@@ -1167,6 +1167,26 @@ class JobStore:
 
             await run_sync(ModelSingleton().release_owner, self.runtime_owner)
 
+    async def wait_and_remove(self, job_id: str) -> _JobRecord:
+        """Wait for a synchronous adapter job and release its transient record."""
+        rec = self.get(job_id)
+        task = self._tasks.get(job_id)
+        try:
+            if task is not None:
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    waiter = asyncio.current_task()
+                    if task.cancelled() and waiter is not None and not waiter.cancelling():
+                        return rec
+                    rec.status = "canceled"
+                    task.cancel()
+                    await drain_future(asyncio.gather(task, return_exceptions=True))
+                    raise
+            return rec
+        finally:
+            self._jobs.pop(job_id, None)
+
     @staticmethod
     def _new_job_id() -> str:
         return "job_" + secrets.token_hex(12)
@@ -2471,6 +2491,9 @@ def create_app(
 
     application.middleware("http")(_auth_middleware)
     application.include_router(_build_v1_router())
+    from .legacy_api import build_legacy_router
+
+    application.include_router(build_legacy_router())
     return application
 
 

@@ -94,4 +94,4 @@ if failures:
 
 上传 → 任务 → 轮询 → 下载的闭环也可以直接用 HTTP 调用完成。[V1 HTTP API 完整示例](http_api.md) 提供了完整的 curl 示例，覆盖完成上传、终态处理（含 `partial`）、客户端超时后继续轮询和产物下载。
 
-4.0 V1 服务不提供旧 `/file_parse` 和 `/tasks` 路由。既有客户端迁移见[迁移指南](../reference/migration_4.md)，Python 渲染与结果保存见[输出格式](../reference/output_files.md)。
+本地解析服务提供[基础 `/file_parse` 适配器](http_api.md#旧版-multipart-适配器)，`/tasks` 仍不提供。既有客户端迁移见[迁移指南](../reference/migration_4.md)，Python 渲染与结果保存见[输出格式](../reference/output_files.md)。

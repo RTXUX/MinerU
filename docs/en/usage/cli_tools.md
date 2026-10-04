@@ -64,7 +64,7 @@ mineru-kit parse ./documents -o ./output --format zip
 mineru-kit api-server --host 127.0.0.1 --port 8000 --tier standard
 ```
 
-Open `http://127.0.0.1:8000/docs` for the generated OpenAPI documentation. The supported API is `/v1/*`; the removed legacy `/file_parse` and `/tasks` routes are not available.
+Open `http://127.0.0.1:8000/docs` for the generated OpenAPI documentation. The primary API is `/v1/*`; the local parse server also provides a [basic `/file_parse` adapter](http_api.md#legacy-multipart-adapter). `/tasks` is not available.
 
 ### Gradio WebUI
 
