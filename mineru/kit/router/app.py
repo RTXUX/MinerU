@@ -20,6 +20,7 @@ from loguru import logger
 
 from ...types import TIERS, select_default_quality_tier, validate_tier
 from ...version import __version__
+from .legacy import file_parse
 from .proxy import (
     RouterProxyError,
     copy_file_to_worker,
@@ -564,6 +565,48 @@ def create_app(
     async def _router_error_handler(_request: Request, exc: RouterProxyError) -> JSONResponse:
         """把 Router 内部错误转换成稳定 V1 error shape。"""
         return router_error_response(exc)
+
+    @application.post(
+        "/file_parse",
+        tags=["Legacy compatibility"],
+        summary="Parse multipart uploads synchronously through an upstream adapter",
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["files"],
+                            "properties": {
+                                "files": {"type": "array", "items": {"type": "string", "format": "binary"}},
+                                "backend": {"type": "string"},
+                                "tier": {"type": "string", "enum": list(TIERS)},
+                                "parse_method": {"type": "string", "enum": ["auto", "txt", "ocr"], "default": "auto"},
+                                "start_page_id": {"type": "integer", "minimum": 0, "default": 0},
+                                "end_page_id": {"type": "integer", "minimum": 0, "default": 99999},
+                                **{
+                                    name: {"type": "boolean", "default": name == "return_md"}
+                                    for name in (
+                                        "return_md",
+                                        "return_middle_json",
+                                        "return_model_output",
+                                        "return_content_list",
+                                        "return_images",
+                                        "response_format_zip",
+                                        "return_original_file",
+                                    )
+                                },
+                            },
+                            "additionalProperties": True,
+                        }
+                    }
+                },
+            },
+        },
+    )
+    async def legacy_file_parse(request: Request) -> Response:
+        return await file_parse(request, pool)
 
     @application.get("/v1/health")
     async def health() -> Response:

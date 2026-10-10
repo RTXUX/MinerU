@@ -87,4 +87,4 @@ curl http://127.0.0.1:8000/file_parse \
 
 兼容范围是传输外壳，**不恢复旧文档协议或旧推理引擎**。Middle JSON、model output 使用当前协议，content list 使用当前 Content List V1 renderer。响应 `backend` 回显请求标签，省略时为 `hybrid-auto-engine`，不代表实际引擎。旧 `lang_list`、`formula_enable`、`table_enable`、`image_analysis` 字段接受但忽略，执行遵循当前解析及服务配置。非空 `server_url` 和 `client_side_output_generation=true` 会被拒绝；VLM 连接需在服务端配置。
 
-适配器复用 V1 并发限制和模型生命周期，每次调用后清理临时上传、产物和任务记录。此入口仅属于本地解析服务，V1 Router 仍仅提供 V1 路由，`/tasks` 不恢复。新客户端应使用 V1，见[迁移指南](../reference/migration_4.md)。
+适配器复用 V1 并发限制和模型生命周期，每次调用后清理临时上传、产物和任务记录。Router 也可按 tier 和负载选择支持该适配器的 upstream，并应用后端认证配置。同步调用没有可恢复的 Router 公共任务 ID；`/tasks` 不恢复。新客户端应使用 V1，见[迁移指南](../reference/migration_4.md)。

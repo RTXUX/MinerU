@@ -39,7 +39,7 @@ def router_cmd(
     worker_concurrency: int = typer.Option(1, "--worker-concurrency", help=t("Concurrency per managed worker")),
     preload_models: bool = typer.Option(False, "--preload-models", help=t("Preload models in managed workers")),
 ) -> None:
-    """启动只暴露 MinerU V1 API 的独立 Router 服务。"""
+    """启动支持 MinerU V1 API 和 /file_parse 兼容接口的 Router。"""
     if worker_tier not in SERVER_TIERS:
         exit_with_message(
             "invalid_request",
@@ -83,7 +83,7 @@ def main() -> None:
     configure_standard_streams()
     configure_global_log_level()
     app = typer.Typer(add_completion=False)
-    app.command(help=t("Start a standalone Router service exposing only the MinerU V1 API."))(router_cmd)
+    app.command(help=t("Start a Router service exposing the V1 API and /file_parse compatibility."))(router_cmd)
     app()
 
 

@@ -26,7 +26,7 @@
 | `mineru-kit webui` | 基于 V1 API 的本地文档解析 Web UI | [mineru-kit webui](mineru-kit-webui.md) |
 | `mineru-kit api-server` | 启动兼容统一 API 的本地解析服务 | [mineru-kit api-server](mineru-kit-api-server.md) |
 | `mineru-kit vlm-server` | 本地 VLM 服务，兼容 OpenAI Chat Completions 协议 | [mineru-kit vlm-server](mineru-kit-vlm-server.md) |
-| `mineru-kit router` | 启动 V1 路由服务，转发到已有 upstream 或管理本地 worker | 仅暴露 `/v1/*` |
+| `mineru-kit router` | 启动 V1 路由服务，转发到已有 upstream 或管理本地 worker | 提供 `/v1/*` 与同步 `/file_parse` 兼容转发 |
 
 ### 独立命令别名
 
@@ -90,6 +90,6 @@ mineru-api --host 127.0.0.1 --port 8000 --tier standard
 - `--upstream-url` 可重复，用于接入已有 MinerU V1 API base URL。
 - `--local-gpus` 支持 `auto`、`none` 或 GPU CSV，例如 `0,1,2`。
 - 本地 worker 统一启动 `mineru-kit api-server`；`--worker-tier` 默认 `standard`，`--worker-concurrency` 默认 `1`。
-- Router 完整代理 V1 health、models、tiers、uploads、files、parse jobs 与 usage；不再提供旧 `/tasks`、`/file_parse` 接口。
+- Router 完整代理 V1 health、models、tiers、uploads、files、parse jobs 与 usage，并将 `/file_parse` 转发到支持该适配器的 upstream；`/tasks` 不恢复。
 - Router 只接受显式声明的参数，不再透传未知模型引擎参数；需要额外调优时应部署独立 upstream。
-- uploads、files 与 jobs 的公共路由状态保存在当前进程内，Router 重启后不保证旧公共 ID 继续可用。
+- uploads、files 与 jobs 默认使用进程内状态；可通过 Redis 为单活 Router 持久化映射。`/file_parse` 同步响应没有公共任务 ID。配置与恢复边界见 [Router 文档](../../en/usage/router.md)。

@@ -33,14 +33,7 @@ from .api_server import (
     create_job,
 )
 
-_BACKEND_TIERS: dict[str, Tier] = {
-    "pipeline": "basic",
-    "hybrid-auto-engine": "standard",
-    "hybrid-http-client": "standard",
-    "vlm-auto-engine": "standard",
-    "vlm-http-client": "standard",
-    "flash": "flash",
-}
+from .legacy_options import BACKEND_TIERS as _BACKEND_TIERS
 
 
 def _result_files(

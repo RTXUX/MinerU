@@ -115,3 +115,37 @@ MINERU_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 Redis tests use unique namespaces and delete only their own keys. They cover
 normal restart, `SIGKILL` recovery, pending uploads, cross-worker cleanup,
 lease renewal/takeover, and persistence failures, using simulated MinerU upstreams.
+
+## Synchronous `/file_parse` compatibility
+
+The router also accepts multipart `POST /file_parse` and forwards it to one
+healthy, non-draining upstream that exposes the API server's compatibility
+adapter. It uses the requested `tier`, or maps `backend` (`pipeline` to `basic`,
+`hybrid-*`/`vlm-*` compatibility names to `standard`, `flash` to `flash`). With
+neither field, the default preference is `standard`, then `basic`, then `flash`.
+An explicit `tier` overrides the backend mapping. Concurrent calls participate
+in the router's active-job load balancing.
+
+```bash
+curl http://127.0.0.1:8002/file_parse \
+  -F 'files=@document.pdf' \
+  -F 'tier=standard' \
+  -F 'return_md=true' \
+  -F 'return_middle_json=true'
+```
+
+Repeated files and form fields, page selection, output flags, and the incoming
+Authorization header are forwarded; configured upstream credentials take
+precedence. JSON and ZIP response bodies, status codes, and download headers come
+from the backend adapter. ZIP responses stream through the router. The endpoint
+uses the backend's current document schemas and validation rules; `/tasks`
+remains unavailable. Upstreams without `/file_parse` return `404`; the router does
+not retry synchronous submissions on another backend.
+
+Synchronous parsing has no upstream read timeout, so it can complete beyond the
+normal 60-second V1 request timeout. Connection/write timeouts remain bounded;
+clients and any intervening gateway should set their desired overall deadline.
+
+These calls have no public router task ID and do not enter the Redis resource
+registry. Their HTTP responses cannot be resumed after a router restart. Use
+`/v1/parse/jobs` when restart-recoverable task mappings are required.

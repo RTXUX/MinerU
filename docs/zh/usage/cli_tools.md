@@ -81,7 +81,7 @@ mineru-kit router --host 127.0.0.1 --port 8002 --local-gpus auto
 mineru-kit vlm-server --engine auto --port 30000
 ```
 
-`mineru-router` 保留为 `mineru-kit router` 的命令名别名。Router 只暴露 V1 API，并且只接受文档中声明的 worker 参数。
+`mineru-router` 保留为 `mineru-kit router` 的命令名别名。Router 提供 V1 API，并可将同步 `/file_parse` 请求转发到支持该适配器的 upstream；配置方式见 [Router 配置与恢复](../../en/usage/router.md)。
 
 ## 环境变量
 

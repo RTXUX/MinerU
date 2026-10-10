@@ -62,7 +62,7 @@ app.command(
     context_settings=vlm_server.FORWARD_CONTEXT_SETTINGS,
     help=t("Start the local VLM server with OpenAI-compatible chat completions."),
 )(vlm_server.vlm_server_cmd)
-app.command("router", help=t("Start a standalone Router service exposing only the MinerU V1 API."))(router.router_cmd)
+app.command("router", help=t("Start a Router service exposing the V1 API and /file_parse compatibility."))(router.router_cmd)
 app.command("version", help=t("Print MinerU and Python versions."))(version_cmd)
 
 

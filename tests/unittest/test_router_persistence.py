@@ -395,3 +395,24 @@ def test_reload_credentials_and_drained_owner_persist(redis_target: tuple[str, s
     with TestClient(make_app()) as client:
         assert client.get(f"/v1/parse/jobs/{job_id}", headers=headers).status_code == 200
         assert seen and set(seen) == {"Bearer rotated"}
+
+
+def test_legacy_response_with_redis_keeps_registry_empty(redis_target: tuple[str, str], tmp_path: Path) -> None:
+    upstream = _FakeV1Upstream("worker-a", ("standard",))
+    app = router(redis_target, tmp_path, upstream)
+    original = upstream.handle
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/file_parse":
+            return httpx.Response(200, stream=httpx.ByteStream(b"zip-output"), headers={"content-type": "application/zip"})
+        return await original(request)
+
+    upstream.handle = handle
+    with TestClient(app) as client:
+        response = client.post("/file_parse", files={"files": ("document.pdf", b"pdf")})
+        assert response.status_code == 200
+        assert response.content == b"zip-output"
+        with redis.Redis.from_url(redis_target[0]) as external:
+            snapshot = json.loads(external.get(app.state.persistence.state_key))
+        assert snapshot["registry"]["routes"] == []
+        assert all(worker.active_jobs == 0 for worker in app.state.worker_pool.workers)

@@ -81,7 +81,7 @@ mineru-kit router --host 127.0.0.1 --port 8002 --local-gpus auto
 mineru-kit vlm-server --engine auto --port 30000
 ```
 
-`mineru-router` remains a command-name alias for `mineru-kit router`. Router exposes only the V1 API and accepts only its documented worker options.
+`mineru-router` remains a command-name alias for `mineru-kit router`. Router exposes the V1 API and forwards synchronous `/file_parse` calls to compatible upstreams. See [router configuration](router.md) for routing, authentication, and Redis recovery options.
 
 ## Environment variables
 

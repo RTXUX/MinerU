@@ -365,7 +365,7 @@ def test_v1_router_aggregates_capabilities_and_routes_cross_worker_job() -> None
         assert health.status_code == 200
         assert client.get("/health").status_code == 404
         assert client.get("/tasks").status_code == 404
-        assert client.post("/file_parse").status_code == 404
+        assert client.post("/file_parse").status_code == 400
         assert [item["id"] for item in tiers.json()["data"]] == ["basic", "standard", "advanced"]
         assert {item["id"] for item in models.json()["data"]} == {"worker-a-model", "worker-b-model"}
 
