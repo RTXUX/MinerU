@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -28,7 +29,13 @@ def upstream_config(value: object) -> UpstreamConfig:
     if not isinstance(url, str):
         raise ValueError("Upstream url must be a string")
     url = url.strip().rstrip("/")
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+        httpx.URL(url)
+        # urllib validates the numeric range only when the port is accessed.
+        parsed.port
+    except (ValueError, httpx.InvalidURL):
+        raise ValueError("Invalid upstream URL") from None
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("Upstream url must be an HTTP(S) base URL without embedded credentials")
     if parsed.query or parsed.fragment:
@@ -55,7 +62,9 @@ def upstream_config(value: object) -> UpstreamConfig:
         headers["authorization"] = f"Bearer {key}"
     try:
         for name, content in headers.items():
-            if not name or any(c in name + content for c in "\r\n"):
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-z-]+", name) or any(
+                ord(c) < 32 and c != "\t" or ord(c) == 127 for c in content
+            ):
                 raise ValueError
         httpx.Headers(headers)
     except (ValueError, UnicodeError):
@@ -68,7 +77,7 @@ def load_upstreams(path: str | None, urls: tuple[str, ...] = ()) -> list[Upstrea
     if path:
         try:
             document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeError, yaml.YAMLError):
             # YAML parser errors can include credentials from the input document.
             raise ValueError("Cannot read or parse router configuration") from None
         if not isinstance(document, dict) or set(document) != {"upstreams"}:

@@ -77,6 +77,9 @@ def test_upstream_identity_survives_reordering(tmp_path: Path) -> None:
     "entry",
     [
         {"url": "ftp://a"},
+        {"url": "http://a:invalid"},
+        {"url": "http://[broken"},
+        {"url": "http://a", "headers": {"Invalid Header": "value"}},
         {"url": "http://user:secret@a"},
         {"url": "http://a", "max_concurrent_jobs": True},
         {"url": "http://a", "headers": {"Host": "b"}},
@@ -141,3 +144,73 @@ def test_sighup_reloads_on_main_event_loop(tmp_path: Path) -> None:
 
     asyncio.run(exercise())
     assert signal.getsignal(signal.SIGHUP) == previous
+
+
+def test_router_cli_wires_recovery_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+    from typer.testing import CliRunner
+    from mineru.kit.main import app
+    from mineru.kit.router import cli
+
+    captured = {}
+
+    def run(application: object, **kwargs: object) -> None:
+        captured["settings"] = application.state.settings
+
+    monkeypatch.setattr(cli.uvicorn, "run", run)
+    monkeypatch.setattr(cli, "create_app", lambda settings: SimpleNamespace(state=SimpleNamespace(settings=settings)))
+    # apply_to_env is tested separately; do not change the pytest process environment.
+    monkeypatch.setattr(RouterSettings, "apply_to_env", lambda self: None)
+    monkeypatch.setenv("MINERU_ROUTER_REDIS_URL", "redis://localhost:6379/3")
+    result = CliRunner().invoke(
+        app,
+        [
+            "router",
+            "--local-gpus",
+            "none",
+            "--config",
+            str(tmp_path / "router.yaml"),
+            "--redis-namespace",
+            "documents",
+            "--source-dir",
+            str(tmp_path / "sources"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    settings = captured["settings"]
+    assert settings.config_file == str(tmp_path / "router.yaml")
+    assert settings.redis_url == "redis://localhost:6379/3"
+    assert settings.redis_namespace == "documents"
+    assert settings.source_dir == str(tmp_path / "sources")
+    result = CliRunner().invoke(app, ["router", "--redis-url", "redis://localhost:6379"])
+    assert result.exit_code != 0
+    assert "--local-gpus none" in result.output
+
+
+def test_router_settings_survive_reload_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import os
+
+    # Track all environment mutations so the fixture restores them afterwards.
+    for key in (
+        "CONFIG",
+        "REDIS_URL",
+        "REDIS_NAMESPACE",
+        "SOURCE_DIR",
+        "UPSTREAM_URLS_JSON",
+        "LOCAL_GPUS",
+        "WORKER_HOST",
+        "WORKER_TIER",
+        "WORKER_CONCURRENCY",
+        "PRELOAD_MODELS",
+    ):
+        name = "MINERU_ROUTER_" + key
+        monkeypatch.setenv(name, os.getenv(name, ""))
+    settings = RouterSettings(
+        config_file=str(tmp_path / "router.yaml"),
+        redis_url="redis://localhost:6379/3",
+        redis_namespace="documents",
+        source_dir=str(tmp_path / "sources"),
+        local_gpus="none",
+    )
+    settings.apply_to_env()
+    assert RouterSettings.from_env() == settings

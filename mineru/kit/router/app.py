@@ -11,6 +11,7 @@ import signal
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
+from collections.abc import Awaitable, Callable
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -366,11 +367,18 @@ async def _job_reconcile_loop(
     registry: ResourceRegistry,
     pool: WorkerPool,
     interval_seconds: float,
+    reconcile: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """按固定间隔运行 Job reconciliation，单次失败不终止循环。"""
     while True:
         await asyncio.sleep(interval_seconds)
-        await _reconcile_jobs_once(registry, pool)
+        try:
+            if reconcile is not None:
+                await reconcile()
+            else:
+                await _reconcile_jobs_once(registry, pool)
+        except RouterProxyError:
+            logger.warning("Router background reconciliation paused: persistence unavailable")
 
 
 def create_app(
@@ -381,7 +389,14 @@ def create_app(
     """创建完整代理 MinerU V1 资源面的 Router FastAPI 应用。"""
     resolved_settings = settings or RouterSettings.from_env()
     registry = ResourceRegistry()
-    source_store = SourceFileStore()
+    source_store = SourceFileStore(resolved_settings.source_dir)
+    persistence = None
+    if resolved_settings.redis_url:
+        try:
+            from .persistence import RedisStateStore
+        except ImportError:
+            raise RuntimeError("Redis persistence requires installing mineru[router]") from None
+        persistence = RedisStateStore(resolved_settings.redis_url, resolved_settings.redis_namespace)
 
     async def _invalidate_replaced_worker(worker: WorkerState) -> None:
         """在本地 worker replacement 发布前移除旧 generation 的资源状态。"""
@@ -397,6 +412,25 @@ def create_app(
         on_local_worker_replaced=_invalidate_replaced_worker,
     )
 
+    def snapshot() -> dict[str, Any]:
+        return {
+            "version": 1,
+            "registry": registry.export_state(),
+            "workers": pool.export_state(),
+            "sources": source_store.export_state(),
+            "started_at": application.state.started_at,
+        }
+
+    async def checkpoint() -> None:
+        if persistence is not None:
+            await persistence.save(snapshot)
+
+    async def reload_upstreams() -> None:
+        if persistence is not None:
+            await persistence.assert_owner()
+        await pool.reload_upstreams()
+        await checkpoint()
+
     @asynccontextmanager
     async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
         """启动 worker pool，并在应用关闭时释放全部网络和子进程资源。"""
@@ -407,19 +441,40 @@ def create_app(
         loop = asyncio.get_running_loop()
         signal_installed = False
         previous_handler = None
+        started = False
 
         async def reload_loop() -> None:
             while True:
                 await reload_event.wait()
                 reload_event.clear()
                 try:
-                    await pool.reload_upstreams()
+                    await reload_upstreams()
                     logger.info("Router upstream configuration reloaded")
                 except ValueError as exc:
                     logger.warning("Router configuration reload rejected: {}", exc)
+                except RouterProxyError:
+                    logger.warning("Router configuration reload failed: persistence unavailable")
 
         try:
+            if persistence is not None:
+                state = await persistence.start()
+                if state is not None:
+                    try:
+                        registry.restore_state(state["registry"])
+                        pool.restore_state(state["workers"])
+                        source_store.restore_state(state["sources"])
+                        application.state.started_at = state["started_at"]
+                        for route in registry.list("job"):
+                            if route.metadata.get("active_counted"):
+                                pool.mark_job_started(route.worker_id)
+                        for kind in ("upload", "file", "job"):
+                            for route in registry.list(kind):
+                                pool.get(route.worker_id)
+                    except (KeyError, TypeError, ValueError):
+                        raise RuntimeError("Invalid router Redis snapshot; refusing to overwrite it") from None
             await pool.start()
+            await checkpoint()
+            started = True
             if resolved_settings.config_file and hasattr(signal, "SIGHUP"):
                 try:
                     previous_handler = signal.getsignal(signal.SIGHUP)
@@ -434,6 +489,7 @@ def create_app(
                         registry,
                         pool,
                         resolved_settings.worker_refresh_interval_seconds,
+                        _reconcile_once_for_state,
                     ),
                     name="mineru-v1-router-job-reconciler",
                 )
@@ -454,8 +510,17 @@ def create_app(
                     await reconcile_task
                 except asyncio.CancelledError:
                     pass
-            await pool.close()
-            source_store.close()
+            try:
+                if started:
+                    try:
+                        await checkpoint()
+                    except RouterProxyError:
+                        logger.warning("Router shutdown checkpoint unavailable")
+            finally:
+                await pool.close()
+                source_store.close()
+                if persistence is not None:
+                    await persistence.close()
 
     application = FastAPI(
         title="MinerU V1 Router",
@@ -466,14 +531,34 @@ def create_app(
     application.state.registry = registry
     application.state.source_store = source_store
     application.state.worker_pool = pool
-    application.state.reload_upstreams = pool.reload_upstreams
+    application.state.reload_upstreams = reload_upstreams
+    application.state.persistence = persistence
     application.state.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     async def _reconcile_once_for_state() -> None:
         """向测试和诊断入口暴露一次显式 Job reconciliation。"""
+        if persistence is not None:
+            await persistence.assert_owner()
         await _reconcile_jobs_once(registry, pool)
+        await checkpoint()
 
     application.state.reconcile_jobs_once = _reconcile_once_for_state
+
+    if persistence is not None:
+
+        @application.middleware("http")
+        async def persist_response(request: Request, call_next: Any) -> Response:
+            try:
+                await persistence.assert_owner()
+                try:
+                    response = await call_next(request)
+                finally:
+                    # Includes partial state changes on errors, and completes before
+                    # Starlette sends the response headers to the client.
+                    await checkpoint()
+                return response
+            except RouterProxyError as exc:
+                return router_error_response(exc)
 
     @application.exception_handler(RouterProxyError)
     async def _router_error_handler(_request: Request, exc: RouterProxyError) -> JSONResponse:

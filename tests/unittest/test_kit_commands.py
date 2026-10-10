@@ -477,9 +477,10 @@ def test_router_upstream_only_worker_pool_builds_remote_server() -> None:
         finally:
             await pool.close()
 
-    assert asyncio.run(_run()) == [
-        ("remote-1", "remote", "http://mineru-api:8000", None, {"standard"}),
-    ]
+    workers = asyncio.run(_run())
+    assert len(workers) == 1
+    assert workers[0][0].startswith("remote-")
+    assert workers[0][1:] == ("remote", "http://mineru-api:8000", None, {"standard"})
 
 
 def test_router_startup_with_no_servers_fails_health_check() -> None:

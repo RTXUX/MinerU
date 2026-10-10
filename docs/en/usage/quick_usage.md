@@ -79,6 +79,7 @@ When an output reaches its budget, follow `next_request` or the returned continu
   >
   >- `mineru-router` and `mineru-kit router` expose the complete `/v1/*` API.
   >- Repeat `--upstream-url` to aggregate multiple existing V1 api-server services, or use `--local-gpus` to launch `mineru-kit api-server` workers automatically.
+  >- See [Router upstream configuration and Redis recovery](router.md) for `--config`, `SIGHUP`, and persistent task mappings.
   >- Use `--preload-models` for router-managed workers; remote upstreams keep their own startup configuration.
   >- Unknown model-engine arguments are not forwarded by Router.
   >- It is intended for advanced multi-service, multi-GPU, and unified-entry deployments.

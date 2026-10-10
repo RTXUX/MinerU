@@ -22,6 +22,11 @@ def router_cmd(
     host: str = typer.Option("127.0.0.1", "--host", help=t("Server host")),
     port: int = typer.Option(8002, "--port", help=t("Server port")),
     config: Path | None = typer.Option(None, "--config", help=t("Upstream YAML file; reload with SIGHUP")),
+    redis_url: str | None = typer.Option(
+        None, "--redis-url", envvar="MINERU_ROUTER_REDIS_URL", help=t("Redis URL for restart recovery")
+    ),
+    redis_namespace: str = typer.Option("default", "--redis-namespace", help=t("Isolated Redis router namespace")),
+    source_dir: Path | None = typer.Option(None, "--source-dir", help=t("Persistent router upload staging directory")),
     reload: bool = typer.Option(False, "--reload", help=t("Enable auto-reload")),
     upstream_url: list[str] | None = typer.Option(
         None,
@@ -49,6 +54,9 @@ def router_cmd(
         settings = RouterSettings(
             upstream_urls=tuple(upstream_url or ()),
             config_file=str(config.resolve()) if config else None,
+            redis_url=redis_url,
+            redis_namespace=redis_namespace,
+            source_dir=str(source_dir.resolve()) if source_dir else None,
             local_gpus=local_gpus,
             worker_host=worker_host,
             worker_tier=cast(ServerTier, worker_tier),

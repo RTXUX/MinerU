@@ -80,6 +80,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+router = ["redis>=5,<7"]
 dev = [
     "lxml-stubs",
 ]

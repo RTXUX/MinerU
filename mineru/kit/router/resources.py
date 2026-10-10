@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 import tempfile
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -62,10 +63,11 @@ class CopiedInputFile:
 class SourceFileStore:
     """在 Router 临时目录中保存可供 cross-worker 重传的输入字节。"""
 
-    def __init__(self) -> None:
-        """创建由当前 Router 进程独占并在关闭时清理的临时目录。"""
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="mineru-v1-router-sources-")
-        self._root = Path(self._temp_dir.name)
+    def __init__(self, directory: str | None = None) -> None:
+        """Use persistent source storage when configured, otherwise a temporary directory."""
+        self._temp_dir = None if directory else tempfile.TemporaryDirectory(prefix="mineru-v1-router-sources-")
+        self._root = Path(directory if directory else self._temp_dir.name).resolve()
+        self._root.mkdir(parents=True, exist_ok=True)
         self._uploads: dict[str, StoredSourceFile] = {}
         self._files: dict[str, StoredSourceFile] = {}
         self._bound_uploads: set[str] = set()
@@ -91,6 +93,9 @@ class SourceFileStore:
                 output.write(chunk)
                 hasher.update(chunk)
                 byte_count += len(chunk)
+            if self._temp_dir is None:
+                output.flush()
+                os.fsync(output.fileno())
         stored = StoredSourceFile(
             path=path,
             bytes=byte_count,
@@ -141,7 +146,35 @@ class SourceFileStore:
         self._uploads.clear()
         self._files.clear()
         self._bound_uploads.clear()
-        self._temp_dir.cleanup()
+        if self._temp_dir is not None:
+            self._temp_dir.cleanup()
+
+    def export_state(self) -> dict[str, Any]:
+        if self._temp_dir is not None:
+            return {}
+
+        def encode(items: dict[str, StoredSourceFile]) -> dict[str, Any]:
+            return {key: {**asdict(value), "path": str(value.path.relative_to(self._root))} for key, value in items.items()}
+
+        return {"uploads": encode(self._uploads), "files": encode(self._files), "bound": sorted(self._bound_uploads)}
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        if not state or self._temp_dir is not None:
+            return
+
+        def decode(items: dict[str, Any]) -> dict[str, StoredSourceFile]:
+            result = {}
+            for key, value in items.items():
+                path = (self._root / value["path"]).resolve()
+                if not path.is_relative_to(self._root):
+                    raise ValueError("Invalid persisted source path")
+                if path.is_file():
+                    result[key] = StoredSourceFile(**{**value, "path": path})
+            return result
+
+        self._uploads = decode(state["uploads"])
+        self._files = decode(state["files"])
+        self._bound_uploads = set(state["bound"])
 
 
 async def stored_file_chunks(path: Path, chunk_size: int = 1024 * 1024) -> AsyncIterator[bytes]:
@@ -238,7 +271,9 @@ class ResourceRegistry:
         """删除公共资源及其反向索引，并返回被删除的记录。"""
         route = self._by_public[kind].pop(public_id, None)
         if route is not None:
-            self._by_upstream.pop((kind, route.owner_scope, route.worker_id, route.upstream_id), None)
+            for key, existing in list(self._by_upstream.items()):
+                if existing is route:
+                    self._by_upstream.pop(key, None)
         return route
 
     def remove_worker(self, worker_id: str) -> list[ResourceRoute]:
@@ -255,6 +290,31 @@ class ResourceRegistry:
             if key[2] == worker_id or id(route) in removed_route_ids:
                 self._by_upstream.pop(key, None)
         return removed
+
+    def export_state(self) -> dict[str, Any]:
+        return {
+            "routes": [asdict(route) for routes in self._by_public.values() for route in routes.values()],
+            "aliases": [[*key, route.public_id] for key, route in self._by_upstream.items()],
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        by_public: dict[ResourceKind, dict[str, ResourceRoute]] = {"upload": {}, "file": {}, "job": {}}
+        for item in state["routes"]:
+            route = ResourceRoute(**item)
+            copies = route.metadata.get("copied_inputs")
+            if copies:
+                route.metadata["copied_inputs"] = [CopiedInputFile(**copy) for copy in copies]
+            if route.public_id in by_public[route.kind]:
+                raise ValueError("Duplicate persisted resource ID")
+            by_public[route.kind][route.public_id] = route
+        by_upstream = {}
+        for kind, owner, worker, upstream_id, public_id in state["aliases"]:
+            route = by_public[kind][public_id]
+            if route.owner_scope != owner:
+                raise ValueError("Invalid persisted resource scope")
+            by_upstream[(kind, owner, worker, upstream_id)] = route
+        self._by_public = by_public
+        self._by_upstream = by_upstream
 
     @staticmethod
     def _new_public_id(kind: ResourceKind) -> str:

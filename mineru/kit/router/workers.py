@@ -131,6 +131,9 @@ class RouterSettings:
 
     upstream_urls: tuple[str, ...] = ()
     config_file: str | None = None
+    redis_url: str | None = field(default=None, repr=False)
+    redis_namespace: str = "default"
+    source_dir: str | None = None
     local_gpus: str = "auto"
     worker_host: str = "127.0.0.1"
     worker_tier: ServerTier = "standard"
@@ -140,6 +143,8 @@ class RouterSettings:
 
     def __post_init__(self) -> None:
         """校验 worker tier、并发数和刷新间隔。"""
+        if self.redis_url and self.local_gpus != "none":
+            raise ValueError("Redis recovery requires --local-gpus none and independently managed upstreams")
         if self.worker_tier not in SERVER_TIERS:
             raise ValueError(f"Unsupported worker tier: {self.worker_tier}")
         if self.worker_concurrency <= 0:
@@ -161,6 +166,9 @@ class RouterSettings:
         return cls(
             upstream_urls=tuple(urls),
             config_file=os.getenv("MINERU_ROUTER_CONFIG") or None,
+            redis_url=os.getenv("MINERU_ROUTER_REDIS_URL") or None,
+            redis_namespace=os.getenv("MINERU_ROUTER_REDIS_NAMESPACE", "default"),
+            source_dir=os.getenv("MINERU_ROUTER_SOURCE_DIR") or None,
             local_gpus=os.getenv("MINERU_ROUTER_LOCAL_GPUS", "auto"),
             worker_host=os.getenv("MINERU_ROUTER_WORKER_HOST", "127.0.0.1"),
             worker_tier=cast(ServerTier, tier),
@@ -170,6 +178,9 @@ class RouterSettings:
 
     def apply_to_env(self) -> None:
         """把 Router 配置写入 reload 子进程可读取的环境变量。"""
+        os.environ["MINERU_ROUTER_REDIS_URL"] = self.redis_url or ""
+        os.environ["MINERU_ROUTER_REDIS_NAMESPACE"] = self.redis_namespace
+        os.environ["MINERU_ROUTER_SOURCE_DIR"] = self.source_dir or ""
         os.environ["MINERU_ROUTER_CONFIG"] = self.config_file or ""
         os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(self.upstream_urls))
         os.environ["MINERU_ROUTER_LOCAL_GPUS"] = self.local_gpus
@@ -382,6 +393,28 @@ class WorkerPool:
     async def reload_upstreams(self) -> None:
         self.configure_upstreams()
         await self.refresh_all()
+
+    def export_state(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "worker_id": worker.worker_id,
+                "base_url": worker.base_url,
+                "source": worker.source,
+                "headers": dict(worker.headers),
+                "max_concurrent_jobs": worker.max_concurrent_jobs,
+            }
+            for worker in self.workers
+            if worker.source == "remote"
+        ]
+
+    def restore_state(self, state: list[dict[str, Any]]) -> None:
+        # Saved owners start drained. The current startup configuration reactivates
+        # only present upstreams and replaces their saved credentials.
+        for item in state:
+            worker = WorkerState(**item, draining=True)
+            if worker.source != "remote" or worker.worker_id in self._workers:
+                raise ValueError("Invalid persisted upstream")
+            self._workers[worker.worker_id] = worker
 
     @property
     def workers(self) -> list[WorkerState]:
