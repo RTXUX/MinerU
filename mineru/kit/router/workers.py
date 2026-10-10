@@ -528,15 +528,19 @@ class WorkerPool:
         *,
         tier: Tier | None,
         required_sources: set[str] | None = None,
+        required_outputs: set[str] | None = None,
         affinity_key: str | None = None,
         preferred_worker_id: str | None = None,
     ) -> WorkerState | None:
         """按 tier、source、preferred worker、affinity 和活动任务数选择目标。"""
         required = required_sources or set()
+        outputs = required_outputs or set()
         eligible = [
             worker
             for worker in self.healthy_workers()
-            if (tier is None or tier in worker.tiers) and required.issubset(set(worker.features.get("sources") or []))
+            if (tier is None or tier in worker.tiers)
+            and required.issubset(set(worker.features.get("sources") or []))
+            and outputs.issubset(set(worker.features.get("output_formats") or []))
         ]
         if not eligible:
             return None

@@ -569,7 +569,7 @@ def create_app(
     @application.post(
         "/file_parse",
         tags=["Legacy compatibility"],
-        summary="Parse multipart uploads synchronously through an upstream adapter",
+        summary="Parse multipart uploads synchronously using upstream V1 jobs",
         openapi_extra={
             "requestBody": {
                 "required": True,

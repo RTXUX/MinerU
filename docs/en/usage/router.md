@@ -118,9 +118,13 @@ lease renewal/takeover, and persistence failures, using simulated MinerU upstrea
 
 ## Synchronous `/file_parse` compatibility
 
-The router also accepts multipart `POST /file_parse` and forwards it to one
-healthy, non-draining upstream that exposes the API server's compatibility
-adapter. It uses the requested `tier`, or maps `backend` (`pipeline` to `basic`,
+The router implements multipart `POST /file_parse` internally. It selects one
+healthy, non-draining upstream with V1 file uploads and ZIP outputs, uploads the
+inputs through `/v1/uploads`, creates a `/v1/parse/jobs` job, polls it, downloads
+its result archives, and constructs the legacy response locally. The upstream
+needs only the V1 API; its `/file_parse` endpoint is never called.
+
+Routing uses the requested `tier`, or maps `backend` (`pipeline` to `basic`,
 `hybrid-*`/`vlm-*` compatibility names to `standard`, `flash` to `flash`). With
 neither field, the default preference is `standard`, then `basic`, then `flash`.
 An explicit `tier` overrides the backend mapping. Concurrent calls participate
@@ -134,18 +138,28 @@ curl http://127.0.0.1:8002/file_parse \
   -F 'return_middle_json=true'
 ```
 
-Repeated files and form fields, page selection, output flags, and the incoming
-Authorization header are forwarded; configured upstream credentials take
-precedence. JSON and ZIP response bodies, status codes, and download headers come
-from the backend adapter. ZIP responses stream through the router. The endpoint
-uses the backend's current document schemas and validation rules; `/tasks`
-remains unavailable. Upstreams without `/file_parse` return `404`; the router does
-not retry synchronous submissions on another backend.
+The router validates legacy options, converts zero-based inclusive PDF ranges to
+V1 page ranges, and preserves duplicate filename handling, JSON-string output
+fields, image data URLs, and the ZIP layout. JSON and ZIP responses are assembled
+from V1 result archives using the same conversion helpers as the local adapter.
+`return_original_file` includes the original uploaded bytes in ZIP output.
+Legacy `lang_list`, `formula_enable`, `table_enable`, and `image_analysis` remain
+accepted but ignored. Per-request `server_url` and client-side output generation
+remain unsupported; `/tasks` remains unavailable.
 
-Synchronous parsing has no upstream read timeout, so it can complete beyond the
-normal 60-second V1 request timeout. Connection/write timeouts remain bounded;
-clients and any intervening gateway should set their desired overall deadline.
+Incoming Authorization is used for all V1 operations unless configured upstream
+credentials override it. Each V1 request keeps the normal bounded HTTP timeout;
+the polling loop has no overall parsing deadline. Clients and gateways can apply
+their own request deadlines. Disconnects observed while polling and request
+cancellation trigger a best-effort cancellation of the upstream job.
 
-These calls have no public router task ID and do not enter the Redis resource
-registry. Their HTTP responses cannot be resumed after a router restart. Use
-`/v1/parse/jobs` when restart-recoverable task mappings are required.
+The router cancels pending uploads and deletes its own input/output File records
+on success or failure. Cleanup is bounded to ten seconds and preserves inputs if
+job cancellation cannot be confirmed. The V1 API has no completed-job deletion
+endpoint; completed job/upload metadata and physical blob retention follow the
+upstream's own policy. A crash or lost submission response can leave private
+upstream resources for that policy to reclaim.
+
+These synchronous calls have no public router task ID and do not enter the Redis
+resource registry. Their HTTP responses cannot be resumed after a router restart.
+Use `/v1/parse/jobs` when restart-recoverable public task mappings are required.
