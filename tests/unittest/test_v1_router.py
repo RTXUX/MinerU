@@ -395,7 +395,7 @@ def test_v1_router_aggregates_capabilities_and_routes_cross_worker_job() -> None
         copied_inputs = list(job_route.metadata.get("copied_inputs") or [])
         assert len(copied_inputs) == 1
         copied_upstream_id = copied_inputs[0].upstream_file_id
-        target = first if job_route.worker_id == "remote-1" else second
+        target = first if router_app.state.worker_pool.get(job_route.worker_id).base_url == "http://worker-a" else second
         assert copied_upstream_id in target.files
 
         completed = client.get(f"/v1/parse/jobs/{job_id}", headers=headers)
@@ -653,7 +653,7 @@ def test_background_reconciler_finalizes_unpolled_cross_worker_job() -> None:
         )
         job_id = created.json()["job_id"]
         route = router_app.state.registry.get("job", job_id)
-        worker = first if route.worker_id == "remote-1" else second
+        worker = first if router_app.state.worker_pool.get(route.worker_id).base_url == "http://worker-a" else second
         copied = list(route.metadata["copied_inputs"])
 
         client.portal.call(router_app.state.reconcile_jobs_once)
@@ -694,7 +694,7 @@ def test_router_reclaims_cross_worker_copy_when_job_is_canceled() -> None:
         job_route = router_app.state.registry.get("job", job_id)
         copied = list(job_route.metadata["copied_inputs"])
         assert len(copied) == 1
-        target = first if copied[0].worker_id == "remote-1" else second
+        target = first if router_app.state.worker_pool.get(copied[0].worker_id).base_url == "http://worker-a" else second
         assert copied[0].upstream_file_id in target.files
 
         canceled = client.delete(f"/v1/parse/jobs/{job_id}", headers=headers)
@@ -737,7 +737,7 @@ def test_public_source_delete_retries_terminal_copy_cleanup() -> None:
         job_id = created.json()["job_id"]
         job_route = router_app.state.registry.get("job", job_id)
         copied = list(job_route.metadata["copied_inputs"])
-        target = first if copied[0].worker_id == "remote-1" else second
+        target = first if router_app.state.worker_pool.get(copied[0].worker_id).base_url == "http://worker-a" else second
         target.fail_file_delete_once.add(copied[0].upstream_file_id)
 
         completed = client.get(f"/v1/parse/jobs/{job_id}", headers=headers)

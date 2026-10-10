@@ -23,6 +23,7 @@ from ...model.runtime.device import get_device
 from ...parser.process_control import ManagedProcessControl
 from ...types import SERVER_TIERS, ServerTier, Tier
 from ...utils.stdio import utf8_subprocess_env
+from .config import load_upstreams
 
 DEFAULT_WORKER_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300.0
@@ -129,6 +130,7 @@ class RouterSettings:
     """保存 Router 服务和其托管 api-server worker 的显式配置。"""
 
     upstream_urls: tuple[str, ...] = ()
+    config_file: str | None = None
     local_gpus: str = "auto"
     worker_host: str = "127.0.0.1"
     worker_tier: ServerTier = "standard"
@@ -158,6 +160,7 @@ class RouterSettings:
         tier = os.getenv("MINERU_ROUTER_WORKER_TIER", "standard")
         return cls(
             upstream_urls=tuple(urls),
+            config_file=os.getenv("MINERU_ROUTER_CONFIG") or None,
             local_gpus=os.getenv("MINERU_ROUTER_LOCAL_GPUS", "auto"),
             worker_host=os.getenv("MINERU_ROUTER_WORKER_HOST", "127.0.0.1"),
             worker_tier=cast(ServerTier, tier),
@@ -167,6 +170,7 @@ class RouterSettings:
 
     def apply_to_env(self) -> None:
         """把 Router 配置写入 reload 子进程可读取的环境变量。"""
+        os.environ["MINERU_ROUTER_CONFIG"] = self.config_file or ""
         os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(self.upstream_urls))
         os.environ["MINERU_ROUTER_LOCAL_GPUS"] = self.local_gpus
         os.environ["MINERU_ROUTER_WORKER_HOST"] = self.worker_host
@@ -312,6 +316,8 @@ class WorkerState:
     max_concurrent_jobs: int = 1
     last_error: str | None = None
     generation: int = 0
+    draining: bool = False
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
 
     @property
     def tiers(self) -> set[Tier]:
@@ -341,12 +347,7 @@ class WorkerPool:
         """在 lifespan 启动阶段解析设备并创建 remote/local worker 状态。"""
         if self._built:
             return
-        for index, url in enumerate(
-            dict.fromkeys(normalize_base_url(item) for item in self.settings.upstream_urls),
-            start=1,
-        ):
-            worker_id = f"remote-{index}"
-            self._workers[worker_id] = WorkerState(worker_id=worker_id, base_url=url, source="remote")
+        self.configure_upstreams()
         for index, gpu in enumerate(parse_local_gpus(self.settings.local_gpus), start=1):
             worker_id = f"local-{gpu if gpu is not None else 'cpu'}-{index}"
             local_worker = ManagedLocalWorker(worker_id, self.settings.worker_host, gpu, self.settings)
@@ -358,6 +359,29 @@ class WorkerPool:
                 max_concurrent_jobs=self.settings.worker_concurrency,
             )
         self._built = True
+
+    def configure_upstreams(self) -> None:
+        """Validate the entire file before changing membership; retain removed owners."""
+        upstreams = load_upstreams(self.settings.config_file, self.settings.upstream_urls)
+        for upstream in upstreams:
+            existing = self._workers.get(upstream.id)
+            if existing is not None and existing.base_url != upstream.url:
+                raise ValueError("Changing an upstream URL requires a new id")
+        active = {upstream.id for upstream in upstreams}
+        for worker in self.workers:
+            if worker.source == "remote":
+                worker.draining = worker.worker_id not in active
+        for upstream in upstreams:
+            worker = self._workers.setdefault(
+                upstream.id, WorkerState(worker_id=upstream.id, base_url=upstream.url, source="remote")
+            )
+            worker.headers = dict(upstream.headers)
+            worker.max_concurrent_jobs = upstream.max_concurrent_jobs
+            worker.draining = False
+
+    async def reload_upstreams(self) -> None:
+        self.configure_upstreams()
+        await self.refresh_all()
 
     @property
     def workers(self) -> list[WorkerState]:
@@ -437,9 +461,9 @@ class WorkerPool:
                     return
         try:
             health, tiers, models = await asyncio.gather(
-                self.client.get(f"{worker.base_url}/v1/health"),
-                self.client.get(f"{worker.base_url}/v1/tiers"),
-                self.client.get(f"{worker.base_url}/v1/models"),
+                self.client.get(f"{worker.base_url}/v1/health", headers=worker.headers),
+                self.client.get(f"{worker.base_url}/v1/tiers", headers=worker.headers),
+                self.client.get(f"{worker.base_url}/v1/models", headers=worker.headers),
             )
             health.raise_for_status()
             tiers.raise_for_status()
@@ -460,7 +484,7 @@ class WorkerPool:
 
     def healthy_workers(self) -> list[WorkerState]:
         """返回当前健康且具有 base URL 的 worker。"""
-        return [worker for worker in self.workers if worker.healthy and worker.base_url]
+        return [worker for worker in self.workers if worker.healthy and worker.base_url and not worker.draining]
 
     def available_tiers(self) -> set[Tier]:
         """聚合全部健康 worker 暴露的请求 tier。"""
@@ -496,6 +520,7 @@ class WorkerPool:
             key=lambda worker: (
                 worker.active_jobs / max(worker.max_concurrent_jobs, 1),
                 worker.active_jobs,
+                worker.base_url,
                 worker.worker_id,
             ),
         )

@@ -79,6 +79,7 @@ async def request_upstream(
     """执行普通 upstream 请求，并把连接失败与超时转成稳定 Router 错误。"""
     outgoing_headers = forwarded_headers(request) if request is not None else {}
     outgoing_headers.update(headers or {})
+    outgoing_headers.update(worker.headers)
     try:
         return await pool.client.request(
             method,
@@ -105,7 +106,7 @@ async def stream_upstream(
     upstream_request = pool.client.build_request(
         method,
         f"{worker.base_url}{path}",
-        headers=forwarded_headers(request),
+        headers={**forwarded_headers(request), **worker.headers},
     )
     try:
         upstream = await pool.client.send(upstream_request, stream=True)

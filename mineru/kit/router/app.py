@@ -7,6 +7,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import signal
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
@@ -14,6 +15,7 @@ from typing import Any, AsyncIterator, Literal
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
+from loguru import logger
 
 from ...types import TIERS, select_default_quality_tier, validate_tier
 from ...version import __version__
@@ -400,8 +402,32 @@ def create_app(
         """启动 worker pool，并在应用关闭时释放全部网络和子进程资源。"""
         application.state.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         reconcile_task: asyncio.Task[None] | None = None
+        reload_task: asyncio.Task[None] | None = None
+        reload_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        signal_installed = False
+        previous_handler = None
+
+        async def reload_loop() -> None:
+            while True:
+                await reload_event.wait()
+                reload_event.clear()
+                try:
+                    await pool.reload_upstreams()
+                    logger.info("Router upstream configuration reloaded")
+                except ValueError as exc:
+                    logger.warning("Router configuration reload rejected: {}", exc)
+
         try:
             await pool.start()
+            if resolved_settings.config_file and hasattr(signal, "SIGHUP"):
+                try:
+                    previous_handler = signal.getsignal(signal.SIGHUP)
+                    loop.add_signal_handler(signal.SIGHUP, reload_event.set)
+                    signal_installed = True
+                except (ValueError, RuntimeError, NotImplementedError):
+                    logger.warning("SIGHUP reload requires a supported main-thread event loop")
+                reload_task = asyncio.create_task(reload_loop(), name="mineru-router-config-reload")
             if resolved_settings.worker_refresh_interval_seconds > 0:
                 reconcile_task = asyncio.create_task(
                     _job_reconcile_loop(
@@ -413,6 +439,15 @@ def create_app(
                 )
             yield
         finally:
+            if signal_installed:
+                loop.remove_signal_handler(signal.SIGHUP)
+                signal.signal(signal.SIGHUP, previous_handler)
+            if reload_task is not None:
+                reload_task.cancel()
+                try:
+                    await reload_task
+                except asyncio.CancelledError:
+                    pass
             if reconcile_task is not None:
                 reconcile_task.cancel()
                 try:
@@ -431,6 +466,7 @@ def create_app(
     application.state.registry = registry
     application.state.source_store = source_store
     application.state.worker_pool = pool
+    application.state.reload_upstreams = pool.reload_upstreams
     application.state.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     async def _reconcile_once_for_state() -> None:
