@@ -68,7 +68,7 @@ def router_cmd(
         help=t("Bearer key enabling Router upstream management APIs"),
     ),
 ) -> None:
-    """启动只暴露 MinerU V1 API 的独立 Router 服务。"""
+    """启动暴露 MinerU V1 API 与 /file_parse 兼容接口的独立 Router 服务。"""
     if worker_tier not in SERVER_STARTUP_TIERS:
         exit_with_message(
             "invalid_request",
@@ -115,7 +115,7 @@ def main() -> None:
     configure_standard_streams()
     configure_global_log_level()
     app = typer.Typer(add_completion=False)
-    app.command(help=t("Start a standalone Router service exposing only the MinerU V1 API."))(router_cmd)
+    app.command(help=t("Start a Router service exposing the V1 API and /file_parse compatibility."))(router_cmd)
     app()
 
 

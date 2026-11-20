@@ -127,3 +127,45 @@ MINERU_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
          tests/unittest/test_router_persistence.py \
          tests/unittest/test_router_admin.py
 ```
+
+## Synchronous `/file_parse` compatibility
+
+`mineru-router` implements legacy multipart `POST /file_parse` internally over
+upstream V1 `/v1/tasks` workers. For each uploaded file in `files` (1–100
+parseable documents up to 200 MiB each), the router reserves a healthy,
+non-draining worker supporting `upload` sources and `default` task output,
+creates a single-file `/v1/tasks` request, uploads missing bytes, polls until
+completion, downloads the V1 result archive, and assembles the legacy JSON or
+`results.zip` response locally. Workers do not expose `/file_parse`.
+
+Routing uses an explicit `tier`, or maps legacy `backend` names (`pipeline` to
+`basic`; `hybrid-engine`, `hybrid-auto-engine`, `hybrid-http-client`,
+`vlm-engine`, `vlm-auto-engine`, and `vlm-http-client` to `standard`; `flash`
+to `flash`). When neither is supplied, PDF/image inputs follow the standard V1
+default order (`standard` → `basic` → `flash` → `advanced`). Native-only office
+and markup inputs always run with `flash` on any capable worker. Multi-file
+requests balance per file across available workers.
+
+```bash
+curl http://127.0.0.1:8002/file_parse \
+  -F 'files=@document.pdf' \
+  -F 'tier=standard' \
+  -F 'return_md=true' \
+  -F 'return_middle_json=true'
+```
+
+Zero-based inclusive `start_page_id` and `end_page_id` values convert to V1 PDF
+page ranges. Duplicate filenames, JSON-string result fields (`md_content`,
+`middle_json`, `content_list`), base64 image data URLs, `response_format_zip`,
+and `return_original_file` retain the legacy envelope, while `middle_json` and
+`content_list` use the current 4.x document schema (`model_output` returns
+`null`). Legacy `lang_list`, `effort`, `formula_enable`, `table_enable`, and
+`image_analysis` fields are accepted and ignored; per-request `server_url` and
+`client_side_output_generation=true` return `400`.
+
+Configured upstream credentials override incoming `Authorization`; otherwise the
+client `Authorization` header is forwarded. Disconnects and cancellations send
+best-effort `POST /v1/tasks/{task_id}/cancel` requests and release temporary
+result leases. Synchronous `/file_parse` calls create no public router task or
+file IDs and do not write temporary sessions to Redis; use `/v1/tasks` or
+[`file-parse-server`](file_parse.md) when recoverable task IDs are needed.

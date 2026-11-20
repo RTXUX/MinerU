@@ -28,7 +28,7 @@
 | `mineru-kit api-server` | 启动兼容统一 API 的本地解析服务 | [mineru-kit api-server](mineru-kit-api-server.md) |
 | `mineru-kit file-parse-server` | 单文件直传、同步附件和超时恢复，连接既有 Tasks 服务 | [file_parse](https://opendatalab.github.io/MinerU/zh/usage/file_parse/) |
 | `mineru-kit vlm-server` | 本地 VLM 服务，兼容 OpenAI Chat Completions 协议 | [mineru-kit vlm-server](mineru-kit-vlm-server.md) |
-| `mineru-kit router` | 启动 V1 路由服务，转发到已有 upstream 或管理本地 worker | 仅暴露 `/v1/*` |
+| `mineru-kit router` | 启动 V1 路由服务，转发到已有 upstream 或管理本地 worker | 提供 `/v1/*` 与内部包装至 `/v1/tasks` 的同步 `/file_parse` 兼容接口 |
 
 ### 独立命令别名
 
@@ -93,7 +93,7 @@ mineru-api --host 127.0.0.1 --port 8000 --tier standard
 - `--local-gpus` 支持 `auto`、`inherit`、`none` 或 GPU CSV，例如 `0,1,2`；`inherit` 仅启动一个继承设备环境的 worker，不枚举或重写可见 GPU。
 - 本地 worker 统一启动 `mineru-kit api-server`；`--worker-tier` 可选 auto/flash/basic/standard/advanced，默认 auto，由各 worker 在自己的设备环境中沿用 API server 的自动选档逻辑确定上限；显式指定档位时，上限包含较低档位；`--worker-concurrency` 默认 `1`。
 - `--task-timeout` 为每个文件取得解析名额后的执行秒数上限，默认 `3600`，必须为正整数；排队和上传不计入。Router 独立监督本地 worker 的实际执行和取消清理，超时后结束旧请求并重建 worker；外部 upstream 不由本层终止或重启。
-- Router 提供 V1 health、models、tiers、usage、按 ID 操作 Files，以及 `/v1/tasks` JSON 创建、按 ID 查询/取消、逐文件上传和结果下载；不提供任务或文件列表。
+- Router 提供 V1 health、models、tiers、usage、按 ID 操作 Files、`/v1/tasks` JSON 创建/查询/取消/逐文件上传和结果下载，并在内部将旧版同步 `POST /file_parse` 包装为下游 `/v1/tasks` 调用（worker 无需暴露 `/file_parse`）；不提供任务或文件列表，也不恢复旧 `/tasks`。
 - Router 只接受显式声明的参数，不再透传未知模型引擎参数；需要额外调优时应部署独立 upstream。
 - tasks 与 files 的公共路由状态默认保存在当前进程内；纯远程模式下（`--local-gpus none`）可通过 `--redis-url`、`--redis-namespace` 与可选 `--source-dir` 为单活 Router 持久化任务、文件映射及动态 upstream 状态。
 - `--admin-api-key` 优先于 `MINERU_ROUTER_ADMIN_API_KEY`，未配置时不启用管理接口；管理凭证不下传，解析认证保持原契约。

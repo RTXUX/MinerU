@@ -116,7 +116,7 @@ mineru-kit router --host 127.0.0.1 --port 8002 --local-gpus auto
 mineru-kit vlm-server --engine auto --port 30000
 ```
 
-`mineru-router` 保留为 `mineru-kit router` 的命令名别名。Router 只暴露 V1 API，并且只接受文档中声明的 worker 参数。
+`mineru-router` 保留为 `mineru-kit router` 的命令名别名。Router 暴露 V1 API，并在内部通过下游 V1 `/v1/tasks` 实现同步 `/file_parse` 兼容接口；它只接受文档中声明的 worker 参数。
 
 使用 `--admin-api-key` 或 `MINERU_ROUTER_ADMIN_API_KEY` 启用独立认证的 upstream 注册、查询和安全注销接口。未配置 `--redis-url` 时动态清单仅当前进程有效；下层 Router 可作为 upstream 接入。[管理 API 与级联示例](./tasks.md#upstream)，声明式文件、`SIGHUP` 重载与 Redis 恢复见 [Router 配置](./router.md)。
 

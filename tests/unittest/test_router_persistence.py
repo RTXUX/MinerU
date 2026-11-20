@@ -897,3 +897,28 @@ uvicorn.run(app, fd=int(os.environ["TEST_ROUTER_FD"]), log_level="warning")
         if keys:
             ext.delete(*keys)
         ext.close()
+
+
+def test_legacy_file_parse_with_redis_keeps_state_empty_and_fences_lease(
+    redis_harness: _RedisHarness,
+    worker_cluster: _IndependentWorkerCluster,
+    tmp_path: Path,
+) -> None:
+    """同步 `/file_parse` 受单活租约保护，且不向 Redis 快照写入临时任务或文件路由。"""
+    worker = api_server.create_app(upload_dir=str(tmp_path / "worker-a"), tiers=("flash",))
+    app = _build_router(redis_harness, tmp_path, {"worker-a": worker}, cluster=worker_cluster)
+    with TestClient(app) as client:
+        response = client.post("/file_parse", files={"files": ("document.html", HTML, "text/html")})
+        assert response.status_code == 200, response.text
+        assert "Shared tasks" in response.json()["results"]["document"]["md_content"]
+        raw = redis_harness.get_raw(app.state.persistence.state_key)
+        assert raw is not None
+        snapshot = json.loads(raw)
+        assert snapshot["registry"]["routes"] == []
+        assert snapshot["tasks"] == []
+        assert all(w.active_jobs == 0 for w in app.state.worker_pool.workers)
+
+        redis_harness.set_raw(app.state.persistence.lease_key, "another-owner", ex=30)
+        fenced = client.post("/file_parse", files={"files": ("document.html", HTML, "text/html")})
+        assert fenced.status_code == 503
+        assert fenced.json()["error"]["code"] == "router_state_unavailable"

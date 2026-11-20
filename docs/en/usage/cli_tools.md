@@ -118,7 +118,7 @@ mineru-kit router --host 127.0.0.1 --port 8002 --local-gpus auto
 mineru-kit vlm-server --engine auto --port 30000
 ```
 
-`mineru-router` remains a command-name alias for `mineru-kit router`. Router exposes only the V1 API and accepts only its documented worker options.
+`mineru-router` remains a command-name alias for `mineru-kit router`. Router exposes the V1 API and implements synchronous `/file_parse` compatibility internally over upstream V1 `/v1/tasks`; it accepts only its documented worker options.
 
 Set `--admin-api-key` or `MINERU_ROUTER_ADMIN_API_KEY` to enable independently authenticated upstream registration, listing, and safe deregistration. Without `--redis-url`, dynamic membership lasts only for the current process; another Router can be registered as an upstream. See [management APIs and cascading](./tasks.md#dynamic-router-upstreams-and-cascading) and [YAML upstream configuration and Redis recovery](./router.md).
 

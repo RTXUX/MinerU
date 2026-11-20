@@ -62,3 +62,37 @@ MINERU_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
          tests/unittest/test_router_persistence.py \
          tests/unittest/test_router_admin.py
 ```
+
+## 同步 `/file_parse` 兼容接口 {#synchronous-file-parse-compatibility}
+
+`mineru-router` 在内部基于下游 V1 `/v1/tasks` 接口实现旧版 multipart
+`POST /file_parse`。对于 `files` 中的每个上传文件（1–100 个可解析文档，单文件上限
+200 MiB），Router 预占支持 `upload` 来源与 `default` 产物的健康非 draining
+节点，发起单文件 `/v1/tasks` 请求、按需上传字节、轮询终态并下载结果归档，在本地组装旧版
+JSON 或 `results.zip` 响应。下游 worker 无需暴露 `/file_parse`。
+
+调度优先使用显式 `tier`，否则映射旧版 `backend`（`pipeline` → `basic`；
+`hybrid-engine`、`hybrid-auto-engine`、`hybrid-http-client`、`vlm-engine`、
+`vlm-auto-engine`、`vlm-http-client` → `standard`；`flash` → `flash`）。两者均省略时，
+PDF/图片输入沿用 V1 默认顺序（`standard` → `basic` → `flash` → `advanced`）；纯原生文档始终以
+`flash` 在任一可用节点执行。多文件请求按单文件粒度在可用 worker 间并发均衡。
+
+```bash
+curl http://127.0.0.1:8002/file_parse \
+  -F 'files=@document.pdf' \
+  -F 'tier=standard' \
+  -F 'return_md=true' \
+  -F 'return_middle_json=true'
+```
+
+从 0 开始的闭区间 `start_page_id`/`end_page_id` 会转换为 V1 PDF 页码范围。同名文件去重、
+字符串化 JSON 字段（`md_content`、`middle_json`、`content_list`）、base64 图片
+Data URL、`response_format_zip` 与 `return_original_file` 保持旧版传输外壳；其中
+`middle_json` 和 `content_list` 输出当前 4.x 文档协议，`model_output` 固定为 `null`。
+历史参数 `lang_list`、`effort`、`formula_enable`、`table_enable`、`image_analysis`
+接受并忽略；非空 `server_url` 与 `client_side_output_generation=true` 返回 `400`。
+
+已配置的下游凭证优先覆盖客户端 `Authorization` 头，未配置时转发客户端认证头。客户端断连或取消会尽力调用
+`POST /v1/tasks/{task_id}/cancel` 并立即释放临时结果租约。同步 `/file_parse`
+不生成公开的 Router 任务或文件 ID，也不向 Redis 快照写入临时状态；需要断连恢复与状态查询时请使用
+`/v1/tasks` 或独立的 [`file-parse-server`](file_parse.md)。

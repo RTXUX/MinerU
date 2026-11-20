@@ -434,7 +434,9 @@ ZH_MESSAGES: dict[str, str] = {
     "Start the local VLM server with OpenAI-compatible chat completions.": (
         "启动本地 VLM 服务,提供 OpenAI 兼容的 chat completions。"
     ),
-    "Start a standalone Router service exposing only the MinerU V1 API.": "启动只暴露 MinerU V1 API 的独立 Router 服务。",
+    "Start a Router service exposing the V1 API and /file_parse compatibility.": (
+        "启动提供 V1 API 与 /file_parse 兼容接口的 Router 服务。"
+    ),
     # ------------------------------------------------------------ kit parse
     "Input files or directories": "输入文件或目录",
     "Output path; required": "输出路径;必填",

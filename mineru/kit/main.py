@@ -45,7 +45,7 @@ COMMANDS: dict[str, CommandSpec] = {
         context_settings_attribute="FORWARD_CONTEXT_SETTINGS",
     ),
     "router": CommandSpec(
-        ".commands.router", "router_cmd", "Start a standalone Router service exposing only the MinerU V1 API."
+        ".commands.router", "router_cmd", "Start a Router service exposing the V1 API and /file_parse compatibility."
     ),
     "models": CommandSpec(".commands.models", "app", "Download, inspect, and verify local MinerU models.", group=True),
     "hardware": CommandSpec(
