@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import cast
 
 import typer
@@ -21,6 +22,7 @@ from .workers import RouterSettings
 def router_cmd(
     host: str = typer.Option("127.0.0.1", "--host", help=t("Server host")),
     port: int = typer.Option(8002, "--port", help=t("Server port")),
+    config: Path | None = typer.Option(None, "--config", help=t("Upstream YAML file; reload with SIGHUP")),
     reload: bool = typer.Option(False, "--reload", help=t("Enable auto-reload")),
     upstream_url: list[str] | None = typer.Option(
         None,
@@ -65,6 +67,7 @@ def router_cmd(
     try:
         settings = RouterSettings(
             upstream_urls=tuple(upstream_url or ()),
+            config_file=str(config.resolve()) if config else None,
             local_gpus=local_gpus,
             worker_host=worker_host,
             worker_tier=cast(ServerStartupTier, worker_tier),

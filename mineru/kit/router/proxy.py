@@ -90,9 +90,11 @@ async def request_upstream(
     generation = worker.generation
     outgoing_headers = forwarded_headers(request) if request is not None else {}
     outgoing_headers.pop("expect", None)
+    if headers:
+        outgoing_headers.update({key.lower(): value for key, value in headers.items()})
+    outgoing_headers.update(worker.headers)
     if json_body is not None:
         outgoing_headers["content-type"] = "application/json"
-    outgoing_headers.update(headers or {})
     reference = worker.acquire_request()
     try:
         response = await pool.client.request(
@@ -164,7 +166,7 @@ async def stream_upstream(
     upstream_request = pool.client.build_request(
         method,
         f"{worker.base_url}{path}",
-        headers=forwarded_headers(request),
+        headers={**forwarded_headers(request), **worker.headers},
     )
     reference = worker.acquire_request()
     upstream: httpx.Response | None = None

@@ -103,6 +103,7 @@ nav:
       - Python SDK: usage/sdk_api.md
       - V1 HTTP API: usage/http_api.md
       - Tasks API: usage/tasks.md
+      - Router Configuration: usage/router.md
       - Synchronous File Parse: usage/file_parse.md
       - Legacy Platforms (MinerU <4): usage/compatibility.md
       - Model Source: usage/model_source.md
@@ -168,6 +169,7 @@ plugins:
             Python SDK: Python SDK
             V1 HTTP API: V1 HTTP API
             Tasks API: Tasks 异步接口
+            Router Configuration: Router 配置与恢复
             Synchronous File Parse: 单文件同步解析
             Legacy Platforms (MinerU <4): 旧平台适配（MinerU <4）
             Migration to 4.0: 迁移到 4.0

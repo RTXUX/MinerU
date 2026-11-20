@@ -7,6 +7,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import signal
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -15,6 +16,7 @@ from typing import Any, AsyncIterator
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from loguru import logger
 
 from ...tasks.errors import ApiServerError
 from ...tasks.execution import TaskExecution
@@ -225,6 +227,10 @@ def create_app(
             source_store.collect_expired()
         pool.remove_drained_workers(registry.worker_route_count)
 
+    async def reload_upstreams() -> None:
+        """重新加载配置文件中的远程 upstream 清单。"""
+        await pool.reload_upstreams()
+
     @asynccontextmanager
     async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
         """启动 worker pool，并在应用关闭时释放全部网络和子进程资源。"""
@@ -232,6 +238,22 @@ def create_app(
         reconcile_task: asyncio.Task[None] | None = None
         collection_task: asyncio.Task[None] | None = None
         lease_task: asyncio.Task[None] | None = None
+        reload_task: asyncio.Task[None] | None = None
+        reload_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        signal_installed = False
+        previous_handler = None
+
+        async def reload_loop() -> None:
+            """串行处理 SIGHUP 重载请求，配置错误保留当前有效快照。"""
+            while True:
+                await reload_event.wait()
+                reload_event.clear()
+                try:
+                    await reload_upstreams()
+                    logger.info("Router upstream configuration reloaded")
+                except ValueError as exc:
+                    logger.warning("Router configuration reload rejected: {}", exc)
 
         async def task_lease_loop() -> None:
             """独立维护 Tasks 的结果租约，禁用 worker 刷新时也保证下载保留期。"""
@@ -251,6 +273,14 @@ def create_app(
             collection_task = asyncio.create_task(collection_loop(), name="mineru-router-retention")
             await pool.start()
             task_store.start()
+            if resolved_settings.config_file and hasattr(signal, "SIGHUP"):
+                try:
+                    previous_handler = signal.getsignal(signal.SIGHUP)
+                    loop.add_signal_handler(signal.SIGHUP, reload_event.set)
+                    signal_installed = True
+                except (ValueError, RuntimeError, NotImplementedError):
+                    logger.warning("SIGHUP reload requires a supported main-thread event loop")
+                reload_task = asyncio.create_task(reload_loop(), name="mineru-router-config-reload")
             lease_task = asyncio.create_task(task_lease_loop(), name="mineru-router-task-result-leases")
             if resolved_settings.worker_refresh_interval_seconds > 0:
                 reconcile_task = asyncio.create_task(
@@ -263,6 +293,12 @@ def create_app(
                 )
             yield
         finally:
+            if signal_installed:
+                loop.remove_signal_handler(signal.SIGHUP)
+                signal.signal(signal.SIGHUP, previous_handler)
+            if reload_task is not None:
+                reload_task.cancel()
+                await asyncio.gather(reload_task, return_exceptions=True)
             if collection_task is not None:
                 collection_task.cancel()
                 await asyncio.gather(collection_task, return_exceptions=True)
@@ -292,6 +328,7 @@ def create_app(
     application.state.source_store = source_store
     application.state.task_store = task_store
     application.state.worker_pool = pool
+    application.state.reload_upstreams = reload_upstreams
     application.state.collect_resources_once = collect_resources_once
     application.state.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 

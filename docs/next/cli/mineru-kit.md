@@ -88,8 +88,8 @@ mineru-api --host 127.0.0.1 --port 8000 --tier standard
 
 当前 `mineru-kit router` 已确定：
 
-- 入口参数包括 `--host`、`--port`、`--reload`、`--upstream-url`、`--local-gpus`、`--worker-host`、`--worker-tier`、`--worker-concurrency`、`--task-timeout`、`--preload-models`、`--admin-api-key`。
-- `--upstream-url` 可重复，用于接入已有 MinerU V1 API base URL。
+- 入口参数包括 `--host`、`--port`、`--config`、`--reload`、`--upstream-url`、`--local-gpus`、`--worker-host`、`--worker-tier`、`--worker-concurrency`、`--task-timeout`、`--preload-models`、`--admin-api-key`。
+- `--upstream-url` 可重复，用于接入已有 MinerU V1 API base URL；`--config` 支持声明包含稳定 `id`、`api_key`/`headers` 与 `max_concurrent_jobs` 的 YAML upstream 清单，并可通过 `SIGHUP` 热重载。
 - `--local-gpus` 支持 `auto`、`inherit`、`none` 或 GPU CSV，例如 `0,1,2`；`inherit` 仅启动一个继承设备环境的 worker，不枚举或重写可见 GPU。
 - 本地 worker 统一启动 `mineru-kit api-server`；`--worker-tier` 可选 auto/flash/basic/standard/advanced，默认 auto，由各 worker 在自己的设备环境中沿用 API server 的自动选档逻辑确定上限；显式指定档位时，上限包含较低档位；`--worker-concurrency` 默认 `1`。
 - `--task-timeout` 为每个文件取得解析名额后的执行秒数上限，默认 `3600`，必须为正整数；排队和上传不计入。Router 独立监督本地 worker 的实际执行和取消清理，超时后结束旧请求并重建 worker；外部 upstream 不由本层终止或重启。

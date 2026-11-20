@@ -590,6 +590,7 @@ ZH_MESSAGES: dict[str, str] = {
     # --------------------------------------------------------- kit router
     "Unsupported worker tier '{tier}'. Supported tiers: {tiers}": "不支持的 worker 档位 '{tier}'。支持的档位: {tiers}",
     "Enable auto-reload": "启用自动重载",
+    "Upstream YAML file; reload with SIGHUP": "上游 YAML 配置文件；通过 SIGHUP 重新加载",
     "Existing MinerU V1 API base URL; repeat to add upstreams": "既有的 MinerU V1 API 基础 URL;可重复传入以添加多个上游",
     "Local workers: auto, inherit, none, or GPU CSV": "本地 worker: auto、inherit、none 或 GPU 列表(CSV)",
     "Maximum execution seconds per file": "单文件最大执行秒数（不含排队，默认 3600）",

@@ -428,6 +428,7 @@ class ManagedLocalRouter:
             "MINERU_ROUTER_WORKER_API_KEY": self.api_key or "",
         })
         environment.pop("MINERU_ROUTER_ADMIN_API_KEY", None)
+        environment.pop("MINERU_ROUTER_CONFIG", None)
         command = self._command(port, upload_dir)
         try:
             self.process = subprocess.Popen(

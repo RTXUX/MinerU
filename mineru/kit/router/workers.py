@@ -15,7 +15,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
@@ -32,6 +31,7 @@ from ...types import SERVER_STARTUP_TIERS, TIERS, ServerStartupTier, Tier
 from ...utils.stdio import utf8_subprocess_env
 from ...utils.retention import resolve_retention_seconds
 from ...utils.async_utils import run_sync
+from .config import load_upstreams, normalize_base_url
 
 DEFAULT_WORKER_REFRESH_INTERVAL_SECONDS = 2.0
 DEFAULT_WORKER_STARTUP_TIMEOUT_SECONDS = 300.0
@@ -53,29 +53,6 @@ def _preload_error(response: httpx.Response) -> ErrorDetail | None:
     if isinstance(code, str) and code.startswith("model_preload_") and isinstance(message, str) and message:
         return ErrorDetail(code=code, message=message)
     return None
-
-
-def normalize_base_url(url: str) -> str:
-    """统一校验并规范化 HTTP base URL，保留路径前缀且禁止凭证、查询和片段。"""
-    normalized = url.strip()
-    try:
-        parts = urlsplit(normalized)
-        parsed = httpx.URL(normalized)
-        valid = (
-            parsed.scheme in {"http", "https"}
-            and bool(parsed.host)
-            and parts.username is None
-            and parts.password is None
-            and "?" not in normalized
-            and "#" not in normalized
-            and not any(char.isspace() or ord(char) < 32 for char in normalized)
-            and "\\" not in normalized
-        )
-    except (ValueError, httpx.InvalidURL):
-        valid = False
-    if not valid:
-        raise ValueError("Upstream must be an HTTP(S) base URL without credentials, query, or fragment")
-    return str(parsed).rstrip("/")
 
 
 def _read_tier_metadata(payload: Any) -> dict[Tier, dict[str, Any]]:
@@ -184,6 +161,7 @@ class RouterSettings:
     """保存 Router 服务和其托管 api-server worker 的显式配置。"""
 
     upstream_urls: tuple[str, ...] = ()
+    config_file: str | None = None
     local_gpus: str = "auto"
     worker_host: str = "127.0.0.1"
     worker_tier: ServerStartupTier = "auto"
@@ -202,6 +180,7 @@ class RouterSettings:
         """校验 worker tier、并发数和刷新间隔。"""
         object.__setattr__(self, "retention_seconds", resolve_retention_seconds(self.retention_seconds))
         object.__setattr__(self, "upstream_urls", tuple(dict.fromkeys(normalize_base_url(url) for url in self.upstream_urls)))
+        object.__setattr__(self, "config_file", (self.config_file or "").strip() or None)
         object.__setattr__(self, "admin_api_key", (self.admin_api_key or "").strip() or None)
         if self.worker_tier not in SERVER_STARTUP_TIERS:
             raise ValueError(f"Unsupported worker tier: {self.worker_tier}")
@@ -227,6 +206,7 @@ class RouterSettings:
         tier = os.getenv("MINERU_ROUTER_WORKER_TIER", "auto")
         return cls(
             upstream_urls=tuple(urls),
+            config_file=os.getenv("MINERU_ROUTER_CONFIG") or None,
             local_gpus=os.getenv("MINERU_ROUTER_LOCAL_GPUS", "auto"),
             worker_host=os.getenv("MINERU_ROUTER_WORKER_HOST", "127.0.0.1"),
             worker_tier=cast(ServerStartupTier, tier),
@@ -243,6 +223,7 @@ class RouterSettings:
     def apply_to_env(self) -> None:
         """把 Router 配置写入 reload 子进程可读取的环境变量。"""
         os.environ["MINERU_API_RETENTION_SECONDS"] = str(self.retention_seconds)
+        os.environ["MINERU_ROUTER_CONFIG"] = self.config_file or ""
         os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(self.upstream_urls))
         os.environ["MINERU_ROUTER_LOCAL_GPUS"] = self.local_gpus
         os.environ["MINERU_ROUTER_WORKER_HOST"] = self.worker_host
@@ -416,6 +397,9 @@ class WorkerState:
     retry_at: float = 0.0
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     state: Literal["active", "draining"] = "active"
+    origin: Literal["cli", "config", "admin"] = "cli"
+    admin_drained: bool = False
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
     active_requests: int = 0
     runtime: dict[str, Any] | None = None
     timed_out_file_ids: set[str] = field(default_factory=set)
@@ -424,6 +408,11 @@ class WorkerState:
     probe_task: asyncio.Task[None] | None = None
     recovery_task: asyncio.Task[None] | None = None
     expired_observed_at: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def draining(self) -> bool:
+        """与管理接口共享 draining 状态，避免维护两份接单开关。"""
+        return self.state == "draining"
 
     @property
     def tiers(self) -> set[Tier]:
@@ -498,7 +487,9 @@ class WorkerPool:
         if self._built:
             return
         for url in self.settings.upstream_urls:
-            self.register_remote(url)
+            self.register_remote(url, origin="cli")
+        if self.settings.config_file:
+            self.configure_upstreams()
         for index, gpu in enumerate(parse_local_gpus(self.settings.local_gpus), start=1):
             device_label = "inherit" if self.settings.local_gpus == "inherit" else (gpu if gpu is not None else "cpu")
             worker_id = f"local-{device_label}-{index}"
@@ -512,6 +503,45 @@ class WorkerPool:
             )
         self._built = True
 
+    def configure_upstreams(self) -> None:
+        """先完整校验 YAML 清单再切换成员；仅对配置文件管理的节点执行 draining。"""
+        upstreams = load_upstreams(self.settings.config_file)
+        for upstream in upstreams:
+            existing_id = self._workers.get(upstream.id)
+            if existing_id is not None:
+                if existing_id.source != "remote" or existing_id.base_url != upstream.url:
+                    raise ValueError("Changing an upstream URL requires a new id")
+                if existing_id.origin != "config":
+                    raise ValueError("Upstream ids must be unique")
+            existing_url = self._remote_urls.get(upstream.url)
+            if existing_url is not None and existing_url.worker_id != upstream.id and existing_url.origin != "config":
+                raise ValueError("Upstream URLs must be unique")
+        active = {upstream.id for upstream in upstreams}
+        for worker in self.workers:
+            if worker.source == "remote" and worker.origin == "config" and worker.worker_id not in active:
+                worker.state = "draining"
+        for upstream in upstreams:
+            worker = self._workers.get(upstream.id)
+            if worker is None:
+                worker = WorkerState(
+                    worker_id=upstream.id,
+                    base_url=upstream.url,
+                    source="remote",
+                    origin="config",
+                )
+                self._workers[upstream.id] = worker
+            worker.origin = "config"
+            worker.headers = dict(upstream.headers)
+            worker.max_concurrent_jobs = upstream.max_concurrent_jobs
+            worker.state = "active"
+            worker.admin_drained = False
+            self._remote_urls[upstream.url] = worker
+
+    async def reload_upstreams(self) -> None:
+        """重新加载 YAML upstream 配置并立即刷新能力快照。"""
+        self.configure_upstreams()
+        await self.refresh_all()
+
     @property
     def workers(self) -> list[WorkerState]:
         """返回当前全部 worker 状态。"""
@@ -521,16 +551,24 @@ class WorkerPool:
         """按稳定 worker 标识读取状态。"""
         return self._workers[worker_id]
 
-    def register_remote(self, url: str) -> tuple[WorkerState, bool]:
+    def register_remote(
+        self, url: str, *, origin: Literal["cli", "admin"] = "admin"
+    ) -> tuple[WorkerState, bool]:
         """同步登记或恢复远程节点；首次 await 前完成去重，删除后不复用 ID。"""
         normalized = normalize_base_url(url)
         existing = self._remote_urls.get(normalized)
         if existing is not None:
-            existing.state = "active"
+            if origin == "admin":
+                existing.admin_drained = False
+                existing.state = "active"
+            elif not existing.admin_drained:
+                existing.state = "active"
             return existing, False
+        while f"remote-{self._next_remote_id}" in self._workers:
+            self._next_remote_id += 1
         worker_id = f"remote-{self._next_remote_id}"
         self._next_remote_id += 1
-        worker = WorkerState(worker_id=worker_id, base_url=normalized, source="remote")
+        worker = WorkerState(worker_id=worker_id, base_url=normalized, source="remote", origin=origin)
         self._workers[worker_id] = worker
         self._remote_urls[normalized] = worker
         return worker, True
@@ -541,6 +579,7 @@ class WorkerPool:
         if worker.source != "remote":
             raise KeyError(worker_id)
         worker.state = "draining"
+        worker.admin_drained = True
         return worker
 
     def remove_drained_workers(self, route_count: Callable[[str], int]) -> None:
@@ -554,7 +593,8 @@ class WorkerPool:
                 and route_count(worker.worker_id) == 0
             ):
                 del self._workers[worker.worker_id]
-                del self._remote_urls[worker.base_url]
+                if self._remote_urls.get(worker.base_url) is worker:
+                    del self._remote_urls[worker.base_url]
 
     async def start(self) -> None:
         """启动本地 worker、刷新全部能力并开启后台健康检查。"""
@@ -744,9 +784,9 @@ class WorkerPool:
         """探测使用短 HTTP 超时，与执行监督及模型启动预算分别管理。"""
         try:
             health, tiers, models = await asyncio.gather(
-                self.client.get(f"{worker.base_url}/v1/health", timeout=5),
-                self.client.get(f"{worker.base_url}/v1/tiers", timeout=5),
-                self.client.get(f"{worker.base_url}/v1/models", timeout=5),
+                self.client.get(f"{worker.base_url}/v1/health", headers=worker.headers, timeout=5),
+                self.client.get(f"{worker.base_url}/v1/tiers", headers=worker.headers, timeout=5),
+                self.client.get(f"{worker.base_url}/v1/models", headers=worker.headers, timeout=5),
             )
             code = (health.json().get("error") or {}).get("code") if health.status_code == 503 else None
             if code in {"engine_dead", "task_timeout"}:
