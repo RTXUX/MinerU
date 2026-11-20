@@ -4,20 +4,27 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import hashlib
+import os
 import secrets
 import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Iterator, Literal, cast, overload
 
+from ...tasks.contracts import ErrorDetail, FileParseInfo
+from ...tasks.execution import TaskExecution, TaskInputMetadata
 from ...utils.retention import resolve_retention_seconds
 from .route_state import ExecutionRouteState, ResultLease
+
+if TYPE_CHECKING:
+    from .workers import WorkerState
 
 ResourceKind = Literal["file", "job"]
 
@@ -86,12 +93,13 @@ class StoredSourceFile:
 
 
 class SourceFileStore:
-    """在 Router 临时目录中保存可供 cross-worker 重传的输入字节。"""
+    """在 Router 暂存或持久化目录中保存可供重传和哈希复用的输入字节。"""
 
-    def __init__(self, retention_seconds: int = 86400) -> None:
-        """创建由当前 Router 进程独占并在关闭时清理的临时目录。"""
-        self._temp_dir = tempfile.TemporaryDirectory(prefix="mineru-v1-router-sources-")
-        self._root = Path(self._temp_dir.name)
+    def __init__(self, retention_seconds: int = 86400, directory: str | None = None) -> None:
+        """配置持久化目录时跨重启保留源文件，否则创建当前进程独占的临时目录。"""
+        self._temp_dir = None if directory else tempfile.TemporaryDirectory(prefix="mineru-v1-router-sources-")
+        self._root = Path(directory if directory else self._temp_dir.name).resolve()  # type: ignore[union-attr]
+        self._root.mkdir(parents=True, exist_ok=True)
         self.retention_seconds = retention_seconds
         self._file_expiry: dict[str, float | None] = {}
         self._active_references: set[str] = set()
@@ -127,6 +135,9 @@ class SourceFileStore:
                         raise ValueError("file_too_large")
                     output.write(chunk)
                     hasher.update(chunk)
+                if self._temp_dir is None:
+                    output.flush()
+                    os.fsync(output.fileno())
         except BaseException:
             path.unlink(missing_ok=True)
             self._uploads.pop(upload_id, None)
@@ -251,7 +262,7 @@ class SourceFileStore:
             self._release_path(stored.path)
 
     def close(self) -> None:
-        """清理当前 Router 进程的全部暂存输入。"""
+        """清理内存索引，并在非持久化模式下移除进程临时目录。"""
         self._uploads.clear()
         self._files.clear()
         self._bound_uploads.clear()
@@ -260,7 +271,76 @@ class SourceFileStore:
         self._active_references.clear()
         self._hash_files.clear()
         self._pins.clear()
-        self._temp_dir.cleanup()
+        if self._temp_dir is not None:
+            self._temp_dir.cleanup()
+
+    def export_state(self) -> dict[str, Any]:
+        """仅在配置了持久化目录时导出源缓存索引与调用方归属。"""
+        if self._temp_dir is not None:
+            return {}
+
+        def encode(items: dict[str, StoredSourceFile]) -> dict[str, Any]:
+            return {
+                key: {**asdict(value), "path": str(value.path.resolve().relative_to(self._root))}
+                for key, value in items.items()
+            }
+
+        return {
+            "uploads": encode(self._uploads),
+            "files": encode(self._files),
+            "bound": sorted(self._bound_uploads),
+            "scopes": dict(self._file_scopes),
+            "expiry": dict(self._file_expiry),
+            "active": sorted(self._active_references),
+        }
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """校验持久化目录内的相对路径并重建调用方哈希缓存与孤儿清理。"""
+        if not state or self._temp_dir is not None:
+            return
+        if not isinstance(state, dict):
+            raise ValueError("Invalid persisted source state")
+
+        def decode(items: dict[str, Any]) -> dict[str, StoredSourceFile]:
+            if not isinstance(items, dict):
+                raise ValueError("Invalid persisted source mapping")
+            result: dict[str, StoredSourceFile] = {}
+            for key, value in items.items():
+                if not isinstance(value, dict):
+                    raise ValueError("Invalid persisted source entry")
+                path = (self._root / str(value["path"])).resolve()
+                if not path.is_relative_to(self._root):
+                    raise ValueError("Invalid persisted source path")
+                expected_bytes = int(value["bytes"])
+                if path.is_file() and path.stat().st_size == expected_bytes:
+                    result[str(key)] = StoredSourceFile(
+                        path=path,
+                        bytes=expected_bytes,
+                        sha256sum=str(value["sha256sum"]),
+                        mime_type=str(value["mime_type"]),
+                    )
+            return result
+
+        self._uploads = decode(state["uploads"])
+        self._files = decode(state["files"])
+        self._bound_uploads = {str(item) for item in state["bound"]}
+        raw_scopes = state.get("scopes") or {}
+        raw_expiry = state.get("expiry") or {}
+        self._file_scopes = {file_id: str(raw_scopes.get(file_id, "anonymous")) for file_id in self._files}
+        self._file_expiry = {
+            file_id: (float(raw_expiry[file_id]) if raw_expiry.get(file_id) is not None else None) for file_id in self._files
+        }
+        self._active_references = {str(item) for item in (state.get("active") or []) if str(item) in self._files}
+        self._hash_files = {}
+        for file_id, stored in self._files.items():
+            scope = self._file_scopes[file_id]
+            self._hash_files.setdefault((scope, stored.sha256sum), set()).add(file_id)
+        uploads_dir = self._root / "uploads"
+        if uploads_dir.is_dir():
+            retained = {stored.path.resolve() for stored in (*self._uploads.values(), *self._files.values())}
+            for candidate in uploads_dir.iterdir():
+                if candidate.is_file() and candidate.resolve() not in retained:
+                    candidate.unlink(missing_ok=True)
 
 
 async def stored_file_chunks(path: Path, chunk_size: int = 1024 * 1024) -> AsyncIterator[bytes]:
@@ -560,6 +640,188 @@ class ResourceRegistry:
             for key, value in self._job_usage(route).items():
                 totals[key] += value
         return totals
+
+    def export_state(self) -> dict[str, Any]:
+        """序列化文件/执行路由、反向别名、预留 ID 集合与累计用量。"""
+        routes: list[dict[str, Any]] = []
+        for file_route in self._by_public["file"].values():
+            routes.append(
+                {
+                    "kind": "file",
+                    "public_id": file_route.public_id,
+                    "owner_scope": file_route.owner_scope,
+                    "worker_id": file_route.worker_id,
+                    "upstream_id": file_route.upstream_id,
+                    "created_at": file_route.created_at,
+                    "payload": copy.deepcopy(file_route.payload),
+                    "lease": {"held": file_route.lease.held, "retain_until": file_route.lease.retain_until},
+                }
+            )
+        for job_route in cast(list[ExecutionRoute], list(self._by_public["job"].values())):
+            exec_obj = job_route.state.execution
+            routes.append(
+                {
+                    "kind": "job",
+                    "public_id": job_route.public_id,
+                    "owner_scope": job_route.owner_scope,
+                    "worker_id": job_route.worker_id,
+                    "upstream_id": job_route.upstream_id,
+                    "created_at": job_route.created_at,
+                    "payload": copy.deepcopy(job_route.payload),
+                    "finalized_at": job_route.finalized_at,
+                    "lease": {"held": job_route.lease.held, "retain_until": job_route.lease.retain_until},
+                    "state": {
+                        "execution": {
+                            "execution_id": exec_obj.execution_id,
+                            "file_id": exec_obj.file_id,
+                            "file_name": exec_obj.file_name,
+                            "status": exec_obj.status,
+                            "created_at": exec_obj.created_at,
+                            "started_at": exec_obj.started_at,
+                            "finished_at": exec_obj.finished_at,
+                            "page_range": exec_obj.page_range,
+                            "parse": exec_obj.parse.model_dump() if exec_obj.parse is not None else None,
+                            "result_file_id": exec_obj.result_file_id,
+                            "error": exec_obj.error.model_dump() if exec_obj.error is not None else None,
+                            "input_metadata": {"bytes": exec_obj.input_metadata.bytes}
+                            if exec_obj.input_metadata is not None
+                            else None,
+                        },
+                        "upstream_file_id": job_route.state.upstream_file_id,
+                        "reservation_active": (
+                            job_route.state.reservation is not None and not job_route.state.reservation.released
+                        ),
+                        "upstream_headers": dict(job_route.state.upstream_headers),
+                        "upstream_lost": job_route.state.upstream_lost,
+                        "loss_error": job_route.state.loss_error.model_dump()
+                        if job_route.state.loss_error is not None
+                        else None,
+                        "result_file_id": job_route.state.result_file_id,
+                    },
+                }
+            )
+        return {
+            "routes": routes,
+            "aliases": [[*key, route.public_id] for key, route in self._by_upstream.items()],
+            "retired_usage": copy.deepcopy(self._retired_usage),
+            "allocated_file_ids": sorted(self._allocated_file_ids),
+            "reserved_file_ids": sorted(self._reserved_file_ids),
+            "task_file_ids": sorted(self._task_file_ids),
+        }
+
+    def restore_state(self, state: dict[str, Any], resolve_worker: Callable[[str], WorkerState]) -> None:
+        """从快照还原全部路由、结果租约及在途 worker 负载预占。"""
+        from .workers import JobReservation
+
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("routes"), list)
+            or not isinstance(state.get("aliases"), list)
+        ):
+            raise ValueError("Invalid persisted resource registry")
+        by_public: dict[ResourceKind, dict[str, ResourceRoute]] = {"file": {}, "job": {}}
+        for item in state["routes"]:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid persisted route")
+            kind = item["kind"]
+            public_id = str(item["public_id"])
+            owner_scope = str(item["owner_scope"])
+            worker_id = str(item["worker_id"])
+            upstream_id = str(item["upstream_id"])
+            worker = resolve_worker(worker_id)
+            raw_lease = item.get("lease") or {}
+            lease = ResultLease(
+                held=bool(raw_lease.get("held", False)),
+                retain_until=float(raw_lease["retain_until"]) if raw_lease.get("retain_until") is not None else None,
+            )
+            if kind == "file":
+                route: ResourceRoute = FileRoute(
+                    public_id=public_id,
+                    owner_scope=owner_scope,
+                    worker_id=worker_id,
+                    upstream_id=upstream_id,
+                    created_at=str(item["created_at"]),
+                    payload=copy.deepcopy(item.get("payload")),
+                    lease=lease,
+                )
+            elif kind == "job":
+                raw_state = item["state"]
+                raw_exec = raw_state["execution"]
+                parse_data = raw_exec.get("parse")
+                error_data = raw_exec.get("error")
+                metadata_data = raw_exec.get("input_metadata")
+                loss_data = raw_state.get("loss_error")
+                execution = TaskExecution(
+                    execution_id=str(raw_exec["execution_id"]),
+                    file_id=str(raw_exec["file_id"]),
+                    file_name=str(raw_exec["file_name"]),
+                    status=raw_exec["status"],
+                    created_at=str(raw_exec["created_at"]),
+                    started_at=raw_exec.get("started_at"),
+                    finished_at=raw_exec.get("finished_at"),
+                    page_range=str(raw_exec.get("page_range") or ""),
+                    parse=FileParseInfo.model_validate(parse_data) if parse_data is not None else None,
+                    result_file_id=raw_exec.get("result_file_id"),
+                    error=ErrorDetail.model_validate(error_data) if error_data is not None else None,
+                    input_metadata=TaskInputMetadata(bytes=int(metadata_data["bytes"])) if metadata_data is not None else None,
+                )
+                upstream_lost = bool(raw_state.get("upstream_lost", False))
+                reservation: JobReservation | None = None
+                if (
+                    bool(raw_state.get("reservation_active", False))
+                    and execution.status not in {"completed", "failed", "canceled"}
+                    and not upstream_lost
+                ):
+                    worker.active_jobs += 1
+                    reservation = JobReservation(worker, worker.generation)
+                route = ExecutionRoute(
+                    public_id=public_id,
+                    owner_scope=owner_scope,
+                    worker_id=worker_id,
+                    upstream_id=upstream_id,
+                    created_at=str(item["created_at"]),
+                    payload=copy.deepcopy(item.get("payload")),
+                    lease=lease,
+                    finalized_at=item.get("finalized_at"),
+                    state=ExecutionRouteState(
+                        execution=execution,
+                        upstream_file_id=raw_state.get("upstream_file_id"),
+                        reservation=reservation,
+                        upstream_headers={str(k): str(v) for k, v in (raw_state.get("upstream_headers") or {}).items()},
+                        upstream_lost=upstream_lost,
+                        loss_error=ErrorDetail.model_validate(loss_data) if loss_data is not None else None,
+                        result_file_id=raw_state.get("result_file_id"),
+                    ),
+                )
+            else:
+                raise ValueError(f"Unsupported persisted resource kind: {kind}")
+            if public_id in by_public[kind]:
+                raise ValueError("Duplicate persisted resource ID")
+            by_public[kind][public_id] = route
+
+        by_upstream: dict[tuple[ResourceKind, str, str, str], ResourceRoute] = {}
+        for alias in state["aliases"]:
+            kind, owner, worker_id, upstream_id, public_id = alias
+            if kind not in ("file", "job"):
+                raise ValueError("Invalid persisted alias kind")
+            resolve_worker(str(worker_id))
+            target = by_public[kind][str(public_id)]
+            if target.owner_scope != owner:
+                raise ValueError("Invalid persisted resource scope")
+            by_upstream[(kind, str(owner), str(worker_id), str(upstream_id))] = target
+
+        raw_retired = state.get("retired_usage") or {}
+        if not isinstance(raw_retired, dict):
+            raise ValueError("Invalid persisted retired usage")
+        self._by_public = by_public
+        self._by_upstream = by_upstream
+        self._retired_usage = {
+            str(scope): {"jobs_created": int(counts["jobs_created"]), "files_processed": int(counts["files_processed"])}
+            for scope, counts in raw_retired.items()
+        }
+        self._allocated_file_ids = {str(fid) for fid in (state.get("allocated_file_ids") or [])} | set(by_public["file"])
+        self._reserved_file_ids = {str(fid) for fid in (state.get("reserved_file_ids") or [])}
+        self._task_file_ids = {str(fid) for fid in (state.get("task_file_ids") or [])}
 
     @staticmethod
     def _job_usage(route: ResourceRoute) -> dict[str, int]:

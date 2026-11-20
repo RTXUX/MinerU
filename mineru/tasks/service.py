@@ -9,7 +9,7 @@ import secrets
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -150,15 +150,35 @@ class TaskRecord:
 class TaskStore:
     """管理固定上传窗口和逐文件执行，不建立第二个解析队列。"""
 
-    def __init__(self, retention_seconds: int) -> None:
+    def __init__(
+        self,
+        retention_seconds: int,
+        *,
+        on_state_change: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         """只在创建应用时分配暂存目录，模块导入不产生副作用。"""
         self.retention_seconds = retention_seconds
+        self._on_state_change = on_state_change
         self._temporary = tempfile.TemporaryDirectory(prefix="mineru-tasks-")
         self._root = Path(self._temporary.name)
         self._records: dict[str, TaskRecord] = {}
         self.storage_lock = asyncio.Lock()
         self._collector: asyncio.Task[None] | None = None
         self._closing = False
+        self._preserve_remote_on_close = False
+
+    @property
+    def preserving_remote(self) -> bool:
+        """指示当前是否处于保留远端在途任务的优雅停机阶段。"""
+        return self._preserve_remote_on_close
+
+    async def _notify_state_change(self) -> None:
+        """后台任务推进状态后尽力触发持久化快照，失败不中断内存监控。"""
+        if self._on_state_change is not None and not self._closing:
+            try:
+                await self._on_state_change()
+            except Exception:
+                logger.warning("Task state persistence callback failed")
 
     def start(self) -> None:
         """启动过期扫描，关闭正常保留期也仍然执行上传截止时间。"""
@@ -400,9 +420,12 @@ class TaskStore:
             file.submitted = True
             self._apply_execution(record, file, execution)
             file.backend.release_uploads(rollback=False)
+            await self._notify_state_change()
             if file.status not in TERMINAL_TASK_STATUSES:
                 await file.finished.wait()
         except asyncio.CancelledError:
+            if self._preserve_remote_on_close:
+                raise
             if file.status != "completed":
                 file.backend.discard_file_id(file.file_id)
             try:
@@ -426,22 +449,91 @@ class TaskStore:
             except Exception:
                 logger.exception("Task file failure cleanup failed: %s", file.execution_id)
         finally:
-            file.finished.set()
-            record.changed.set()
-            file.backend.release_uploads(rollback=not file.submitted)
-            self._aggregate(record)
+            if self._preserve_remote_on_close:
+                file.backend.close_local_pins()
+            else:
+                file.finished.set()
+                record.changed.set()
+                file.backend.release_uploads(rollback=not file.submitted)
+                self._aggregate(record)
+                await self._notify_state_change()
+
+    async def _wait_restored_file(self, record: TaskRecord, file: TaskFileRecord) -> None:
+        """等待重启恢复的在途文件结束；显式取消时同步取消下游作业。"""
+        try:
+            if file.status not in TERMINAL_TASK_STATUSES:
+                await file.finished.wait()
+        except asyncio.CancelledError:
+            if self._preserve_remote_on_close:
+                raise
+            if file.status != "completed":
+                file.backend.discard_file_id(file.file_id)
+            try:
+                await drain_future(asyncio.create_task(file.backend.cancel(file.execution_id)))
+            except Exception:
+                logger.exception("Task file cancellation failed: %s", file.execution_id)
+            if file.status not in TERMINAL_TASK_STATUSES:
+                file.status = "canceled"
+        finally:
+            if self._preserve_remote_on_close:
+                file.backend.close_local_pins()
+            else:
+                file.finished.set()
+                record.changed.set()
+                self._aggregate(record)
+
+    def resume_restored_record(self, record: TaskRecord, *, missing_source_indices: set[int]) -> None:
+        """注册从持久化快照恢复的任务，并按各文件当前阶段拉起后台协程。"""
+        self._records[record.id] = record
+        self._expire_uploads(record)
+        if record.retention_epoch is not None:
+            for file in record.file_states:
+                file.finished.set()
+
+            async def _completed_noop() -> None:
+                return
+
+            record.operation = asyncio.create_task(_completed_noop(), name=f"mineru-task-done-{record.id}")
+            return
+
+        for index, (item, file) in enumerate(zip(record.inputs, record.file_states)):
+            if file.status in TERMINAL_TASK_STATUSES:
+                file.finished.set()
+            elif index in missing_source_indices:
+                file.status = "failed"
+                file.error = ErrorDetail(
+                    code="source_file_unavailable",
+                    message="Staged upload bytes were lost across restart; configure --source-dir or submit a new task",
+                )
+                file.backend.discard_file_id(file.file_id)
+                file.backend.release_uploads(rollback=True)
+                file.finished.set()
+            elif file.submitted:
+                file.operation = asyncio.create_task(
+                    self._wait_restored_file(record, file), name=f"mineru-task-file-{file.execution_id}"
+                )
+            elif item.url is not None or file.upload is not None:
+                file.status = "waiting-file"
+                self._start_file(record, index)
+        self._aggregate(record)
+        record.operation = asyncio.create_task(self._monitor(record), name=f"mineru-task-{record.id}")
 
     async def _monitor(self, record: TaskRecord) -> None:
         """应用持有父任务监控；HTTP 断连不影响执行，所有子文件清理后才开始保留期。"""
         try:
             while record.status not in TERMINAL_TASK_STATUSES:
                 record.changed.clear()
+                previous_status = record.status
                 await self.refresh(record)
+                if record.status != previous_status:
+                    await self._notify_state_change()
                 if record.status not in TERMINAL_TASK_STATUSES:
                     await self._wait_for_change(record)
             operations = [file.operation for file in record.file_states if file.operation is not None]
             if operations:
                 await asyncio.gather(*operations, return_exceptions=True)
+            if self._preserve_remote_on_close:
+                return
             for item, file in zip(record.inputs, record.file_states):
                 if file.status != "completed":
                     file.backend.discard_file_id(item.file_id)
@@ -453,6 +545,10 @@ class TaskStore:
                 await file.backend.release_result(file.execution_id, finished)
                 file.backend.release_uploads(rollback=not file.submitted)
             record.retention_epoch = finished
+            await self._notify_state_change()
+        except asyncio.CancelledError:
+            if not self._preserve_remote_on_close:
+                raise
         except Exception:
             logger.exception("Task result cleanup failed: %s", record.id)
         finally:
@@ -552,19 +648,38 @@ class TaskStore:
             record.changed.set()
             await drain_future(record.operation)
 
-    async def shutdown(self) -> None:
-        """停止接单并排空全部文件执行和结果租约，最后释放临时目录。"""
+    async def shutdown(self, *, preserve_remote: bool = False) -> None:
+        """停止接单并回收本地协程；持久化模式下保留下游在途任务与结果租约供重启接管。"""
         self._closing = True
+        self._preserve_remote_on_close = preserve_remote
         if self._collector is not None:
             self._collector.cancel()
             await asyncio.gather(self._collector, return_exceptions=True)
-        for record in tuple(self._records.values()):
-            record.lease_expires_at = 0
-            if record.status not in TERMINAL_TASK_STATUSES:
-                await self.cancel(record, wait=False)
-        await asyncio.gather(
-            *(record.operation for record in self._records.values() if record.operation is not None), return_exceptions=True
-        )
+            self._collector = None
+        if preserve_remote:
+            file_tasks = [
+                file.operation
+                for record in self._records.values()
+                for file in record.file_states
+                if file.operation is not None and not file.operation.done()
+            ]
+            monitor_tasks = [
+                record.operation
+                for record in self._records.values()
+                if record.operation is not None and not record.operation.done()
+            ]
+            for task in (*file_tasks, *monitor_tasks):
+                task.cancel()
+            await asyncio.gather(*file_tasks, *monitor_tasks, return_exceptions=True)
+        else:
+            for record in tuple(self._records.values()):
+                record.lease_expires_at = 0
+                if record.status not in TERMINAL_TASK_STATUSES:
+                    await self.cancel(record, wait=False)
+            await asyncio.gather(
+                *(record.operation for record in self._records.values() if record.operation is not None),
+                return_exceptions=True,
+            )
         self._temporary.cleanup()
 
 

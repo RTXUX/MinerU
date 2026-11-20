@@ -414,21 +414,26 @@ class ManagedLocalRouter:
         # Router 及嵌套 worker 的暂存目录归属于本次托管生命周期，已物化的 WebUI 产物仍在 output_dir。
         environment.update({name: str(temporary_root) for name in ("TMPDIR", "TEMP", "TMP")})
         environment.update(control.child_env())
-        environment.update({
-            "MINERU_ROUTER_UPSTREAM_URLS_JSON": "[]",
-            "MINERU_ROUTER_LOCAL_GPUS": "inherit",
-            "MINERU_ROUTER_WORKER_HOST": "127.0.0.1",
-            "MINERU_ROUTER_WORKER_TIER": self.tier,
-            "MINERU_ROUTER_WORKER_CONCURRENCY": str(self.concurrency),
-            "MINERU_ROUTER_PRELOAD_MODELS": "1" if self.preload_models else "0",
-            "MINERU_ROUTER_TASK_TIMEOUT_SECONDS": str(self.task_timeout_seconds),
-            "MINERU_ROUTER_WORKER_STARTUP_TIMEOUT_SECONDS": str(_startup_timeout_seconds()),
-            "MINERU_ROUTER_DISABLE_IMAGE_ANALYSIS": "1" if self.disable_image_analysis else "0",
-            "MINERU_ROUTER_MANAGED_WEBUI": "1",
-            "MINERU_ROUTER_WORKER_API_KEY": self.api_key or "",
-        })
+        environment.update(
+            {
+                "MINERU_ROUTER_UPSTREAM_URLS_JSON": "[]",
+                "MINERU_ROUTER_LOCAL_GPUS": "inherit",
+                "MINERU_ROUTER_WORKER_HOST": "127.0.0.1",
+                "MINERU_ROUTER_WORKER_TIER": self.tier,
+                "MINERU_ROUTER_WORKER_CONCURRENCY": str(self.concurrency),
+                "MINERU_ROUTER_PRELOAD_MODELS": "1" if self.preload_models else "0",
+                "MINERU_ROUTER_TASK_TIMEOUT_SECONDS": str(self.task_timeout_seconds),
+                "MINERU_ROUTER_WORKER_STARTUP_TIMEOUT_SECONDS": str(_startup_timeout_seconds()),
+                "MINERU_ROUTER_DISABLE_IMAGE_ANALYSIS": "1" if self.disable_image_analysis else "0",
+                "MINERU_ROUTER_MANAGED_WEBUI": "1",
+                "MINERU_ROUTER_WORKER_API_KEY": self.api_key or "",
+            }
+        )
         environment.pop("MINERU_ROUTER_ADMIN_API_KEY", None)
         environment.pop("MINERU_ROUTER_CONFIG", None)
+        environment.pop("MINERU_ROUTER_REDIS_URL", None)
+        environment.pop("MINERU_ROUTER_REDIS_NAMESPACE", None)
+        environment.pop("MINERU_ROUTER_SOURCE_DIR", None)
         command = self._command(port, upload_dir)
         try:
             self.process = subprocess.Popen(

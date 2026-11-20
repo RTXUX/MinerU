@@ -162,6 +162,9 @@ class RouterSettings:
 
     upstream_urls: tuple[str, ...] = ()
     config_file: str | None = None
+    redis_url: str | None = field(default=None, repr=False)
+    redis_namespace: str = "default"
+    source_dir: str | None = None
     local_gpus: str = "auto"
     worker_host: str = "127.0.0.1"
     worker_tier: ServerStartupTier = "auto"
@@ -177,11 +180,16 @@ class RouterSettings:
     worker_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        """校验 worker tier、并发数和刷新间隔。"""
+        """校验 worker tier、并发数、Redis 恢复约束与刷新间隔。"""
         object.__setattr__(self, "retention_seconds", resolve_retention_seconds(self.retention_seconds))
         object.__setattr__(self, "upstream_urls", tuple(dict.fromkeys(normalize_base_url(url) for url in self.upstream_urls)))
         object.__setattr__(self, "config_file", (self.config_file or "").strip() or None)
+        object.__setattr__(self, "redis_url", (self.redis_url or "").strip() or None)
+        object.__setattr__(self, "redis_namespace", (self.redis_namespace or "").strip() or "default")
+        object.__setattr__(self, "source_dir", (self.source_dir or "").strip() or None)
         object.__setattr__(self, "admin_api_key", (self.admin_api_key or "").strip() or None)
+        if self.redis_url and self.local_gpus != "none":
+            raise ValueError("Redis recovery requires --local-gpus none and independently managed upstreams")
         if self.worker_tier not in SERVER_STARTUP_TIERS:
             raise ValueError(f"Unsupported worker tier: {self.worker_tier}")
         if self.worker_concurrency <= 0:
@@ -207,6 +215,9 @@ class RouterSettings:
         return cls(
             upstream_urls=tuple(urls),
             config_file=os.getenv("MINERU_ROUTER_CONFIG") or None,
+            redis_url=os.getenv("MINERU_ROUTER_REDIS_URL") or None,
+            redis_namespace=os.getenv("MINERU_ROUTER_REDIS_NAMESPACE") or "default",
+            source_dir=os.getenv("MINERU_ROUTER_SOURCE_DIR") or None,
             local_gpus=os.getenv("MINERU_ROUTER_LOCAL_GPUS", "auto"),
             worker_host=os.getenv("MINERU_ROUTER_WORKER_HOST", "127.0.0.1"),
             worker_tier=cast(ServerStartupTier, tier),
@@ -224,6 +235,9 @@ class RouterSettings:
         """把 Router 配置写入 reload 子进程可读取的环境变量。"""
         os.environ["MINERU_API_RETENTION_SECONDS"] = str(self.retention_seconds)
         os.environ["MINERU_ROUTER_CONFIG"] = self.config_file or ""
+        os.environ["MINERU_ROUTER_REDIS_URL"] = self.redis_url or ""
+        os.environ["MINERU_ROUTER_REDIS_NAMESPACE"] = self.redis_namespace
+        os.environ["MINERU_ROUTER_SOURCE_DIR"] = self.source_dir or ""
         os.environ["MINERU_ROUTER_UPSTREAM_URLS_JSON"] = json.dumps(list(self.upstream_urls))
         os.environ["MINERU_ROUTER_LOCAL_GPUS"] = self.local_gpus
         os.environ["MINERU_ROUTER_WORKER_HOST"] = self.worker_host
@@ -319,8 +333,13 @@ class ManagedLocalWorker:
             self.temp_dir = None
             raise
         self.control = control
-        logger.info("Started router worker {} pid={} task_timeout={}s startup_timeout={}s", self.worker_id,
-                    self.process.pid, self.settings.task_timeout_seconds, self.settings.worker_startup_timeout_seconds)
+        logger.info(
+            "Started router worker {} pid={} task_timeout={}s startup_timeout={}s",
+            self.worker_id,
+            self.process.pid,
+            self.settings.task_timeout_seconds,
+            self.settings.worker_startup_timeout_seconds,
+        )
         try:
             await self.wait_until_ready(client, self.settings.worker_startup_timeout_seconds)
         except Exception:
@@ -360,7 +379,11 @@ class ManagedLocalWorker:
         control = self.control
         if process is not None:
             await run_sync(
-                stop_process_tree, process, control, timeout_seconds=timeout_seconds, grouped=self.process_group,
+                stop_process_tree,
+                process,
+                control,
+                timeout_seconds=timeout_seconds,
+                grouped=self.process_group,
                 process_job=self.process_job,
             )
         self.process = None
@@ -542,6 +565,69 @@ class WorkerPool:
         self.configure_upstreams()
         await self.refresh_all()
 
+    def export_state(self) -> list[dict[str, Any]]:
+        """导出全部远程节点快照，包括动态注册节点及仍持有引用的 draining 节点。"""
+        return [
+            {
+                "worker_id": worker.worker_id,
+                "base_url": worker.base_url,
+                "source": worker.source,
+                "origin": worker.origin,
+                "state": worker.state,
+                "admin_drained": worker.admin_drained,
+                "headers": dict(worker.headers),
+                "max_concurrent_jobs": worker.max_concurrent_jobs,
+            }
+            for worker in self.workers
+            if worker.source == "remote"
+        ]
+
+    def restore_state(self, state: list[dict[str, Any]]) -> None:
+        """恢复远程节点归属：动态节点保留原状态，CLI/YAML 节点由本次启动参数重新激活。"""
+        if not isinstance(state, list):
+            raise ValueError("Invalid persisted worker list")
+        for item in state:
+            if not isinstance(item, dict) or item.get("source") != "remote":
+                raise ValueError("Invalid persisted upstream")
+            worker_id = str(item["worker_id"])
+            if not worker_id or worker_id.startswith("local-") or worker_id in self._workers:
+                raise ValueError("Invalid persisted upstream ID")
+            url = normalize_base_url(str(item["base_url"]))
+            origin = item.get("origin", "config")
+            if origin not in {"cli", "config", "admin"}:
+                raise ValueError("Invalid persisted upstream origin")
+            saved_state = item.get("state", "draining")
+            if saved_state not in {"active", "draining"}:
+                raise ValueError("Invalid persisted upstream state")
+            admin_drained = bool(item.get("admin_drained", False))
+            capacity = item.get("max_concurrent_jobs", 1)
+            if type(capacity) is not int or capacity < 1:
+                raise ValueError("Invalid persisted upstream capacity")
+            raw_headers = item.get("headers") or {}
+            if not isinstance(raw_headers, dict) or any(
+                not isinstance(k, str) or not isinstance(v, str) for k, v in raw_headers.items()
+            ):
+                raise ValueError("Invalid persisted upstream headers")
+            initial_state: Literal["active", "draining"] = (
+                cast(Literal["active", "draining"], saved_state) if origin == "admin" and not admin_drained else "draining"
+            )
+            worker = WorkerState(
+                worker_id=worker_id,
+                base_url=url,
+                source="remote",
+                origin=cast(Literal["cli", "config", "admin"], origin),
+                state=initial_state,
+                admin_drained=admin_drained,
+                headers={k.lower(): v for k, v in raw_headers.items()},
+                max_concurrent_jobs=capacity,
+            )
+            self._workers[worker_id] = worker
+            if url not in self._remote_urls or initial_state == "active":
+                self._remote_urls[url] = worker
+            suffix = worker_id.removeprefix("remote-")
+            if worker_id.startswith("remote-") and suffix.isdigit():
+                self._next_remote_id = max(self._next_remote_id, int(suffix) + 1)
+
     @property
     def workers(self) -> list[WorkerState]:
         """返回当前全部 worker 状态。"""
@@ -551,9 +637,7 @@ class WorkerPool:
         """按稳定 worker 标识读取状态。"""
         return self._workers[worker_id]
 
-    def register_remote(
-        self, url: str, *, origin: Literal["cli", "admin"] = "admin"
-    ) -> tuple[WorkerState, bool]:
+    def register_remote(self, url: str, *, origin: Literal["cli", "admin"] = "admin") -> tuple[WorkerState, bool]:
         """同步登记或恢复远程节点；首次 await 前完成去重，删除后不复用 ID。"""
         normalized = normalize_base_url(url)
         existing = self._remote_urls.get(normalized)
@@ -680,13 +764,10 @@ class WorkerPool:
             now = time.monotonic()
             candidates = control.expired_executions(now) if control is not None else ()
             active_ids = {lease.execution_id for lease in candidates}
-            worker.expired_observed_at = {
-                key: at for key, at in worker.expired_observed_at.items() if key in active_ids
-            }
+            worker.expired_observed_at = {key: at for key, at in worker.expired_observed_at.items() if key in active_ids}
             # 为控制线程送达完成通知留一个刷新周期；第二次确认仍未退出才替换，避免边界误判。
             expired = tuple(
-                lease for lease in candidates
-                if now - worker.expired_observed_at.setdefault(lease.execution_id, now) >= 0.25
+                lease for lease in candidates if now - worker.expired_observed_at.setdefault(lease.execution_id, now) >= 0.25
             )
             if expired:
                 newly_expired = {lease.file_id for lease in expired} - worker.timed_out_file_ids
@@ -694,8 +775,12 @@ class WorkerPool:
                 worker.last_error = "task_timeout"
                 worker.restart_requested = True
                 if newly_expired:
-                    logger.error("Worker {} generation {} execution timeout: {}", worker.worker_id, worker.generation,
-                                 [lease.execution_id for lease in expired])
+                    logger.error(
+                        "Worker {} generation {} execution timeout: {}",
+                        worker.worker_id,
+                        worker.generation,
+                        [lease.execution_id for lease in expired],
+                    )
             process = local.process
             if worker.restart_requested or process is None or process.poll() is not None:
                 worker.healthy = False
@@ -759,8 +844,12 @@ class WorkerPool:
                     worker.startup_error = None
                     worker.restart_failures = 0
                     worker.retry_at = 0.0
-                    logger.info("Router worker {} generation {} ready after {:.2f}s", worker.worker_id,
-                                worker.generation, time.monotonic() - recovery_started)
+                    logger.info(
+                        "Router worker {} generation {} ready after {:.2f}s",
+                        worker.worker_id,
+                        worker.generation,
+                        time.monotonic() - recovery_started,
+                    )
                 except Exception as exc:
                     worker.last_error = str(exc)
                     worker.startup_error = exc.error if isinstance(exc, ApiServerError) else None

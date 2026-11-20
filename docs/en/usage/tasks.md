@@ -159,7 +159,7 @@ PUT raw bytes using the returned `upload.url/headers`; no completion call is req
 - Upload links expire 3600 seconds after creation and are not renewed by polling. Uploads admitted before the deadline may finish; files not yet admitted become `failed/upload_expired`. Processing of successfully uploaded files is not limited by this deadline.
 - Do not repeat successful PUTs. Query after a lost response: skip upload for `pending/running/completed`, poll `waiting-file` without an upload object, and retry within bounds only after failure when a valid upload action remains. Expired uploads need a new task. Chunk-level resumable uploads are not supported.
 
-Local source caches default to 24-hour retention with collection every five minutes; active tasks and transfers protect source bytes. API/Router task records and indexes are in memory and are not guaranteed to survive restarts.
+Local source caches default to 24-hour retention with collection every five minutes; active tasks and transfers protect source bytes. By default, API/Router task records and indexes are in memory and do not survive restarts; standalone remote-upstream Routers can enable [Redis restart recovery](router.md#redis-restart-recovery).
 
 ## Dynamic Router upstreams and cascading
 
@@ -208,7 +208,7 @@ mineru-kit router --local-gpus none \
 
 The same POST endpoint can add Router C at runtime. Use independent worker pools below each inner Router and an acyclic topology. Global load accounting and cross-Router task takeover are not provided.
 
-**Dynamic membership lasts only for the current process.** Registration and deregistration do not modify startup configuration. Restarting restores the `--upstream-url` list; dynamic nodes must be registered again, and worker IDs are not stable across restarts. The outer Router remains a single point of failure, and existing tasks are not guaranteed to recover after any Router restarts.
+**Without Redis persistence, dynamic membership lasts only for the current process.** Registration and deregistration do not modify startup configuration: restarting an in-memory Router restores the `--upstream-url` / `--config` list, dynamic nodes must be registered again, and existing tasks are not guaranteed to recover. Enable [Redis restart recovery](router.md#redis-restart-recovery) (`--redis-url` with `--local-gpus none`) when single-router task, file, and dynamic-upstream state must survive restarts.
 
 ## States and cancellation
 

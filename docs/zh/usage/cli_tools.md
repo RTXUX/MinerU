@@ -118,7 +118,7 @@ mineru-kit vlm-server --engine auto --port 30000
 
 `mineru-router` 保留为 `mineru-kit router` 的命令名别名。Router 只暴露 V1 API，并且只接受文档中声明的 worker 参数。
 
-使用 `--admin-api-key` 或 `MINERU_ROUTER_ADMIN_API_KEY` 启用独立认证的 upstream 注册、查询和安全注销接口。动态清单仅当前进程有效；下层 Router 可作为 upstream 接入。[管理 API 与级联示例](./tasks.md#upstream)，声明式文件与 `SIGHUP` 重载见 [Router 配置](./router.md)。
+使用 `--admin-api-key` 或 `MINERU_ROUTER_ADMIN_API_KEY` 启用独立认证的 upstream 注册、查询和安全注销接口。未配置 `--redis-url` 时动态清单仅当前进程有效；下层 Router 可作为 upstream 接入。[管理 API 与级联示例](./tasks.md#upstream)，声明式文件、`SIGHUP` 重载与 Redis 恢复见 [Router 配置](./router.md)。
 
 ## 环境变量
 

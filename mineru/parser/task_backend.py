@@ -109,6 +109,12 @@ class ApiTaskBackend:
             self.files.unpin_cached_blob(sha)
         self._pins.clear()
 
+    def close_local_pins(self) -> None:
+        """释放当前进程持有的 blob 预检引用。"""
+        for sha in self._pins:
+            self.files.unpin_cached_blob(sha)
+        self._pins.clear()
+
     async def submit(
         self, execution_id: str, options: UploadTaskOptions, item: TaskFileItem, upload: TaskUpload | None
     ) -> TaskExecution:

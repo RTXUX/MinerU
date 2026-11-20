@@ -226,3 +226,81 @@ def test_sighup_reloads_on_main_event_loop(tmp_path: Path) -> None:
 
     asyncio.run(exercise())
     assert signal.getsignal(signal.SIGHUP) == previous
+
+
+def test_router_cli_wires_recovery_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI 正确组装 --config、--redis-url、--redis-namespace 与 --source-dir，并拒绝本地 GPU 混用。"""
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from mineru.kit.main import app
+    from mineru.kit.router import cli
+
+    captured: dict[str, object] = {}
+
+    def fake_run_server(application: object, **kwargs: object) -> None:
+        captured["settings"] = application.state.settings  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(cli, "run_server", fake_run_server)
+    monkeypatch.setattr(cli, "create_app", lambda settings: SimpleNamespace(state=SimpleNamespace(settings=settings)))
+    monkeypatch.setattr(RouterSettings, "apply_to_env", lambda self: None)
+    monkeypatch.setenv("MINERU_ROUTER_REDIS_URL", "redis://localhost:6379/3")
+    result = CliRunner().invoke(
+        app,
+        [
+            "router",
+            "--local-gpus",
+            "none",
+            "--config",
+            str(tmp_path / "router.yaml"),
+            "--redis-namespace",
+            "documents",
+            "--source-dir",
+            str(tmp_path / "sources"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    settings = captured["settings"]
+    assert isinstance(settings, RouterSettings)
+    assert settings.config_file == str((tmp_path / "router.yaml").resolve())
+    assert settings.redis_url == "redis://localhost:6379/3"
+    assert settings.redis_namespace == "documents"
+    assert settings.source_dir == str((tmp_path / "sources").resolve())
+    rejected = CliRunner().invoke(app, ["router", "--redis-url", "redis://localhost:6379"])
+    assert rejected.exit_code != 0
+    assert "--local-gpus none" in rejected.output
+
+
+def test_router_settings_survive_reload_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """apply_to_env 与 from_env 完整往返全部配置与持久化环境变量。"""
+    for key in (
+        "CONFIG",
+        "REDIS_URL",
+        "REDIS_NAMESPACE",
+        "SOURCE_DIR",
+        "UPSTREAM_URLS_JSON",
+        "LOCAL_GPUS",
+        "WORKER_HOST",
+        "WORKER_TIER",
+        "WORKER_CONCURRENCY",
+        "PRELOAD_MODELS",
+        "ADMIN_API_KEY",
+        "TASK_TIMEOUT_SECONDS",
+        "WORKER_STARTUP_TIMEOUT_SECONDS",
+        "DISABLE_IMAGE_ANALYSIS",
+        "MANAGED_WEBUI",
+        "WORKER_API_KEY",
+    ):
+        monkeypatch.delenv("MINERU_ROUTER_" + key, raising=False)
+    monkeypatch.delenv("MINERU_API_RETENTION_SECONDS", raising=False)
+    settings = RouterSettings(
+        config_file=str(tmp_path / "router.yaml"),
+        redis_url="redis://localhost:6379/3",
+        redis_namespace="documents",
+        source_dir=str(tmp_path / "sources"),
+        local_gpus="none",
+        admin_api_key="admin-key",
+    )
+    settings.apply_to_env()
+    assert RouterSettings.from_env() == settings

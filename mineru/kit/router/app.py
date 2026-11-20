@@ -9,6 +9,7 @@ import hashlib
 import json
 import signal
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, AsyncIterator
@@ -161,23 +162,67 @@ async def _job_reconcile_loop(
     registry: ResourceRegistry,
     pool: WorkerPool,
     interval_seconds: float,
+    reconcile: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """按固定间隔运行 Job reconciliation，单次失败不终止循环。"""
     while True:
         await asyncio.sleep(interval_seconds)
-        await _reconcile_jobs_once(registry, pool)
+        try:
+            if reconcile is not None:
+                await reconcile()
+            else:
+                await _reconcile_jobs_once(registry, pool)
+        except RouterProxyError:
+            logger.warning("Router background reconciliation paused: persistence unavailable")
 
 
 def create_app(
     settings: RouterSettings | None = None,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
+    persistence_client: Any = None,
 ) -> FastAPI:
     """创建完整代理 MinerU V1 资源面的 Router FastAPI 应用。"""
     resolved_settings = settings or RouterSettings.from_env()
     registry = ResourceRegistry(resolved_settings.retention_seconds)
-    source_store = SourceFileStore(resolved_settings.retention_seconds)
-    task_store = TaskStore(resolved_settings.retention_seconds)
+    source_store = SourceFileStore(resolved_settings.retention_seconds, resolved_settings.source_dir)
+    persistence = None
+    if resolved_settings.redis_url:
+        from .persistence import RedisStateStore
+
+        persistence = RedisStateStore(
+            resolved_settings.redis_url,
+            resolved_settings.redis_namespace,
+            client=persistence_client,
+        )
+
+    async def assert_persistence_owner() -> None:
+        """在后台写操作或下游建单前检查单活租约持有权。"""
+        if persistence is not None:
+            await persistence.assert_owner()
+
+    def snapshot() -> dict[str, Any]:
+        """构建当前 Router 进程的一致性快照字典。"""
+        from .persistence import export_task_store
+
+        return {
+            "version": 1,
+            "registry": registry.export_state(),
+            "workers": pool.export_state(),
+            "sources": source_store.export_state(),
+            "tasks": export_task_store(task_store),
+            "started_at": application.state.started_at,
+        }
+
+    async def checkpoint() -> None:
+        """在启用 Redis 持久化时将最新路由与任务状态原子写入快照。"""
+        if persistence is not None:
+            await persistence.save(snapshot)
+
+    task_store = TaskStore(
+        resolved_settings.retention_seconds,
+        on_state_change=checkpoint if persistence is not None else None,
+    )
 
     async def _invalidate_replaced_worker(worker: WorkerState) -> None:
         """在本地 worker replacement 发布前移除旧 generation 的资源状态。"""
@@ -190,13 +235,15 @@ def create_app(
                 continue
             payload = route.payload or {}
             code = "task_timeout" if route.state.upstream_file_id in worker.timed_out_file_ids else "worker_restarted"
-            error = ErrorDetail(code=code, message="Task execution timed out" if code == "task_timeout"
-                                else "Worker was replaced; please retry")
+            error = ErrorDetail(
+                code=code, message="Task execution timed out" if code == "task_timeout" else "Worker was replaced; please retry"
+            )
             route.state.release_reservation()
             route.state.upstream_lost = True
             route.state.loss_error = error
-            route.state.execution = replace(previous, status="failed", finished_at=utc_now_iso(),
-                                            result_file_id=None, error=error)
+            route.state.execution = replace(
+                previous, status="failed", finished_at=utc_now_iso(), result_file_id=None, error=error
+            )
             failed[route.public_id] = route.state.execution
             route.finalized_at = route.state.execution.finished_at
             payload["status"] = "failed"
@@ -223,13 +270,21 @@ def create_app(
     def collect_resources_once() -> None:
         """先按原保留契约回收路由，再移除无执行、传输或结果引用的 draining 节点。"""
         if resolved_settings.retention_seconds:
+            task_store.collect_expired()
             registry.collect_expired(source_store)
             source_store.collect_expired()
         pool.remove_drained_workers(registry.worker_route_count)
 
     async def reload_upstreams() -> None:
-        """重新加载配置文件中的远程 upstream 清单。"""
+        """重新加载配置文件中的远程 upstream 清单并持久化最新节点状态。"""
+        if persistence is not None:
+            await persistence.assert_owner()
         await pool.reload_upstreams()
+        await checkpoint()
+
+    async def finalize_task_job(route: ExecutionRoute, execution: TaskExecution, request: Request | None) -> None:
+        """新任务沿用既有产物元数据补齐及负载释放边界。"""
+        await _finalize_terminal_job(route, execution)
 
     @asynccontextmanager
     async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -243,6 +298,7 @@ def create_app(
         loop = asyncio.get_running_loop()
         signal_installed = False
         previous_handler = None
+        started = False
 
         async def reload_loop() -> None:
             """串行处理 SIGHUP 重载请求，配置错误保留当前有效快照。"""
@@ -254,6 +310,8 @@ def create_app(
                     logger.info("Router upstream configuration reloaded")
                 except ValueError as exc:
                     logger.warning("Router configuration reload rejected: {}", exc)
+                except RouterProxyError:
+                    logger.warning("Router configuration reload failed: persistence unavailable")
 
         async def task_lease_loop() -> None:
             """独立维护 Tasks 的结果租约，禁用 worker 刷新时也保证下载保留期。"""
@@ -261,18 +319,60 @@ def create_app(
 
             while True:
                 await asyncio.sleep(30)
-                await maintain_task_result_leases(registry, pool)
+                try:
+                    if persistence is not None:
+                        await persistence.assert_owner()
+                    await maintain_task_result_leases(registry, pool)
+                    await checkpoint()
+                except RouterProxyError:
+                    logger.warning("Router task lease maintenance paused: persistence unavailable")
 
         async def collection_loop() -> None:
             """复用五分钟扫描回收路由和节点；永久保留模式仍可回收无引用节点。"""
             while True:
                 await asyncio.sleep(RETENTION_SCAN_INTERVAL_SECONDS)
-                collect_resources_once()
+                try:
+                    if persistence is not None:
+                        await persistence.assert_owner()
+                    collect_resources_once()
+                    await checkpoint()
+                except RouterProxyError:
+                    logger.warning("Router resource collection paused: persistence unavailable")
 
         try:
-            collection_task = asyncio.create_task(collection_loop(), name="mineru-router-retention")
+            restored_tasks: list[dict[str, Any]] | None = None
+            if persistence is not None:
+                from .persistence import restore_task_store
+
+                state = await persistence.start()
+                if state is not None:
+                    try:
+                        pool.restore_state(state["workers"])
+                        source_store.restore_state(state["sources"])
+                        registry.restore_state(state["registry"], pool.get)
+                        application.state.started_at = str(state["started_at"])
+                        restored_tasks = state.get("tasks", [])
+                        if not isinstance(restored_tasks, list):
+                            raise ValueError("Invalid persisted tasks list")
+                    except (KeyError, TypeError, ValueError):
+                        raise RuntimeError("Invalid router Redis snapshot; refusing to overwrite it") from None
             await pool.start()
             task_store.start()
+            if restored_tasks is not None:
+                try:
+                    restore_task_store(
+                        restored_tasks,
+                        app=application,
+                        task_store=task_store,
+                        source_store=source_store,
+                        registry=registry,
+                        finalize=finalize_task_job,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    raise RuntimeError("Invalid router Redis snapshot; refusing to overwrite it") from None
+            await checkpoint()
+            started = True
+            collection_task = asyncio.create_task(collection_loop(), name="mineru-router-retention")
             if resolved_settings.config_file and hasattr(signal, "SIGHUP"):
                 try:
                     previous_handler = signal.getsignal(signal.SIGHUP)
@@ -288,6 +388,7 @@ def create_app(
                         registry,
                         pool,
                         resolved_settings.worker_refresh_interval_seconds,
+                        _reconcile_once_for_state,
                     ),
                     name="mineru-v1-router-job-reconciler",
                 )
@@ -308,15 +409,25 @@ def create_app(
                     await reconcile_task
                 except asyncio.CancelledError:
                     pass
-            await task_store.shutdown()
+            await task_store.shutdown(preserve_remote=persistence is not None)
             if lease_task is not None:
                 lease_task.cancel()
                 await asyncio.gather(lease_task, return_exceptions=True)
-            from .tasks import maintain_task_result_leases
+            if persistence is None:
+                from .tasks import maintain_task_result_leases
 
-            await maintain_task_result_leases(registry, pool, release=True)
-            await pool.close()
-            source_store.close()
+                await maintain_task_result_leases(registry, pool, release=True)
+            try:
+                if started:
+                    try:
+                        await checkpoint()
+                    except RouterProxyError:
+                        logger.warning("Router shutdown checkpoint unavailable")
+            finally:
+                await pool.close()
+                source_store.close()
+                if persistence is not None:
+                    await persistence.close()
 
     application = FastAPI(
         title="MinerU V1 Router",
@@ -328,9 +439,17 @@ def create_app(
     application.state.source_store = source_store
     application.state.task_store = task_store
     application.state.worker_pool = pool
+    application.state.persistence = persistence
+    application.state.checkpoint = checkpoint
+    application.state.assert_persistence_owner = assert_persistence_owner
     application.state.reload_upstreams = reload_upstreams
     application.state.collect_resources_once = collect_resources_once
     application.state.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    if persistence is not None:
+        from .persistence import PersistenceMiddleware
+
+        application.add_middleware(PersistenceMiddleware, persistence=persistence, checkpoint=checkpoint)
 
     @application.middleware("http")
     async def managed_auth(request: Request, call_next: Any) -> Response:
@@ -339,18 +458,22 @@ def create_app(
             path = request.url.path
             root = request.scope.get("root_path", "").rstrip("/")
             if root and path.startswith(root + "/"):
-                path = path[len(root):]
+                path = path[len(root) :]
             public = path in {"/v1/health", "/v1/models", "/v1/tiers"} or path.startswith(
                 ("/v1/models/", "/openapi", "/docs", "/redoc")
             )
             if not public and request.headers.get("authorization") != f"Bearer {resolved_settings.worker_api_key}":
-                return JSONResponse({"error": {"code": "invalid_api_key", "message": "Invalid or missing API key"}},
-                                    status_code=401)
+                return JSONResponse(
+                    {"error": {"code": "invalid_api_key", "message": "Invalid or missing API key"}}, status_code=401
+                )
         return await call_next(request)
 
     async def _reconcile_once_for_state() -> None:
         """向测试和诊断入口暴露一次显式 Job reconciliation。"""
+        if persistence is not None:
+            await persistence.assert_owner()
         await _reconcile_jobs_once(registry, pool)
+        await checkpoint()
 
     application.state.reconcile_jobs_once = _reconcile_once_for_state
 
@@ -379,8 +502,11 @@ def create_app(
             {
                 "status": "ok",
                 "version": __version__,
-                **({"runtime": workers[0].runtime} if resolved_settings.managed_webui
-                   and len(workers) == 1 and workers[0].runtime is not None else {}),
+                **(
+                    {"runtime": workers[0].runtime}
+                    if resolved_settings.managed_webui and len(workers) == 1 and workers[0].runtime is not None
+                    else {}
+                ),
                 "features": {
                     "task_output_formats": task_output_formats,
                     "sources": sources,
@@ -462,10 +588,6 @@ def create_app(
         return _usage_payload(request, registry, pool, _caller_scope(request))
 
     from .tasks import RouterTaskBackend, install_task_error_handlers
-
-    async def finalize_task_job(route: ExecutionRoute, execution: TaskExecution, request: Request | None) -> None:
-        """新任务沿用既有产物元数据补齐及负载释放边界。"""
-        await _finalize_terminal_job(route, execution)
 
     def task_backend(request: Request) -> RouterTaskBackend:
         """显式组装 Router 适配器，便捷入口不通过 HTTP 请求自身。"""

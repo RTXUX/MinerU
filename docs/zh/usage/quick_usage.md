@@ -79,6 +79,7 @@ mineru read "doc:ab12cd3/tier:standard/page:11" --json
   >
   >- `mineru-router` 与 `mineru-kit router` 都只暴露完整 `/v1/*` API。
   >- 可重复使用 `--upstream-url` 聚合多个 V1 api-server，也可通过 `--local-gpus` 自动拉起 `mineru-kit api-server` worker。
+  >- `--config`、`SIGHUP` 热重载及基于 Redis 的任务映射持久化见 [Router 配置与恢复](router.md)。
   >- `--preload-models` 只作用于 Router 托管的本地 worker，远端 upstream 保持自己的启动配置。
   >- Router 不再透传未知模型引擎参数。
   >- 适用于多服务、多 GPU 和统一入口部署场景。

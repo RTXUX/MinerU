@@ -36,6 +36,7 @@ from ...tasks.service import TERMINAL_TASK_STATUSES, file_chunks, resolve_task_t
 from ...utils.async_utils import drain_future
 from .proxy import (
     RouterProxyError,
+    forwarded_headers,
     request_upstream,
     require_worker_generation,
     rewrite_file_payload,
@@ -243,12 +244,51 @@ class RouterTaskBackend:
         self.request = Request(dict(request.scope))
         self.owner_scope = owner_scope
         self.finalize = finalize
+        self.upstream_headers = forwarded_headers(self.request)
         self.sources: SourceFileStore = request.app.state.source_store
         self.registry: ResourceRegistry = request.app.state.registry
         self.pool: WorkerPool = request.app.state.worker_pool
         self._pins = ExitStack()
         self._prepared_sources: list[str] = []
         self._task_sources: list[str] = []
+
+    @classmethod
+    def from_restored(
+        cls,
+        app: FastAPI,
+        owner_scope: str,
+        upstream_headers: Mapping[str, str],
+        finalize: FinalizeExecution,
+        *,
+        prepared_sources: list[str] | None = None,
+        task_sources: list[str] | None = None,
+    ) -> RouterTaskBackend:
+        """从持久化元数据重建无活跃客户端连接时的后台任务上下文。"""
+        encoded_headers = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in upstream_headers.items()]
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/tasks",
+            "raw_path": b"/v1/tasks",
+            "query_string": b"",
+            "headers": encoded_headers,
+            "app": app,
+        }
+        instance = cls(Request(scope), owner_scope, finalize)
+        instance._prepared_sources = list(prepared_sources or ())
+        instance._task_sources = list(task_sources or ())
+        return instance
+
+    def rebind_restored_sources(self, sources: SourceFileStore) -> None:
+        """为恢复的待提交和运行中文件重新持有源缓存引用与传输 pin。"""
+        for ref_id in self._prepared_sources:
+            stored = sources.find_file(ref_id)
+            if stored is not None and stored.path.is_file():
+                sources.hold_reference(ref_id)
+                self._pins.enter_context(sources.pin(stored))
+        for ref_id in self._task_sources:
+            if sources.find_file(ref_id) is not None:
+                sources.hold_reference(ref_id)
 
     def fork(self) -> RouterTaskBackend:
         """每个输入文件拥有独立暂存引用和 worker 调度上下文。"""
@@ -334,7 +374,7 @@ class RouterTaskBackend:
                 self.sources.bind_source(private_id, stored, owner_scope=self.owner_scope)
             self.sources.hold_reference(private_id)
             self._pins.enter_context(self.sources.pin(stored))
-            return replace(upload, path=stored.path, file_id=None)
+            return replace(upload, path=stored.path, file_id=private_id)
 
     def release_uploads(self, *, rollback: bool) -> None:
         """回滚未交接的源引用并释放传输租约，成功提交的缓存由父任务持有。"""
@@ -342,6 +382,10 @@ class RouterTaskBackend:
             for reference_id in self._prepared_sources:
                 self.sources.delete_file(reference_id)
             self._prepared_sources.clear()
+        self._pins.close()
+
+    def close_local_pins(self) -> None:
+        """优雅关闭持久化 Router 时只释放本地文件句柄，保留源缓存条目。"""
         self._pins.close()
 
     async def _wait_for_upload_ready(
@@ -372,12 +416,84 @@ class RouterTaskBackend:
                 return ready
             await asyncio.sleep(1)
 
+    async def _resume_existing_submission(
+        self, existing: ExecutionRoute, item: TaskFileItem, upload: TaskUpload | None
+    ) -> TaskExecution:
+        """接管崩溃前已登记的下游任务，补传缺失文件或直接查询状态，避免重复建单。"""
+        worker = self.pool.get(existing.worker_id)
+        upstream_id = existing.upstream_id
+        generation = worker.generation
+        response = await _worker_request(
+            self.pool,
+            worker,
+            "GET",
+            f"/v1/tasks/{quote(upstream_id, safe='')}",
+            request=self.request,
+            headers={"x-mineru-task-lease-seconds": "120"},
+        )
+        if response.status_code == 404 or worker.generation != generation:
+            return _lost_execution(existing)
+        try:
+            detail = TaskDetailResponse.model_validate(_checked_json(response))
+        except ValidationError as exc:
+            raise_api_error(502, code="invalid_upstream_response", message=str(exc))
+        if len(detail.files) != 1:
+            raise_api_error(502, code="invalid_upstream_response", message="Expected one task file")
+        (remote_file,) = detail.files
+        if existing.state.upstream_file_id is None:
+            existing.state.upstream_file_id = remote_file.file_id
+        if item.url is None and remote_file.status == "waiting-file" and remote_file.upload is not None:
+            if upload is None or not upload.path.is_file():
+                await drain_future(asyncio.create_task(self._cancel_remote(worker, upstream_id)))
+                existing.state.release_reservation()
+                existing.finalized_at = utc_now_iso()
+                existing.lease.retain_until = time.time()
+                raise_api_error(
+                    409,
+                    code="source_file_unavailable",
+                    message="Staged upload bytes were lost across restart; configure --source-dir or submit a new task",
+                )
+            resource_path = _worker_path(worker, remote_file.upload.url)
+            put_response = await _worker_request(
+                self.pool,
+                worker,
+                "PUT",
+                resource_path,
+                request=self.request,
+                content=file_chunks(upload.path),
+                headers={
+                    **remote_file.upload.headers,
+                    "content-length": str(upload.bytes),
+                    "x-mineru-task-lease-seconds": "120",
+                },
+            )
+            try:
+                UploadFileResponse.model_validate(_checked_json(put_response))
+            except ValidationError as exc:
+                raise_api_error(502, code="invalid_upstream_response", message=str(exc))
+            require_worker_generation(worker, generation)
+        await self._wait_for_upload_ready(worker, upstream_id, generation, item, remote_file.file_id)
+        result = await self.get(existing.public_id)
+        self._task_sources.extend(self._prepared_sources)
+        self._prepared_sources.clear()
+        return result
+
     async def submit(
         self, execution_id: str, options: UploadTaskOptions, item: TaskFileItem, upload: TaskUpload | None
     ) -> TaskExecution:
         """为单文件预占 worker，并把公开文件身份与下游身份一一关联。"""
         if options.tier is None:
             raise ValueError("Task tier must be resolved before execution")
+        assert_owner: Callable[[], Awaitable[None]] | None = getattr(self.request.app.state, "assert_persistence_owner", None)
+        checkpoint: Callable[[], Awaitable[None]] | None = getattr(self.request.app.state, "checkpoint", None)
+        try:
+            if assert_owner is not None:
+                await assert_owner()
+            existing = self.registry.find("job", execution_id)
+            if existing is not None:
+                return await self._resume_existing_submission(existing, item, upload)
+        except RouterProxyError as exc:
+            raise_api_error(exc.status_code, code=exc.code, message=exc.message, param=exc.param)
         lightweight = is_flash_only_parse_extension(item.file_name)
         tier = batch_effective_parse_tier(options.tier, item.file_name)
         reservation = self.pool.reserve_job(
@@ -391,6 +507,7 @@ class RouterTaskBackend:
         upstream_id: str | None = None
         route: ExecutionRoute | None = None
         transferred = False
+        preserve_on_cancel = False
         try:
             worker_input = item.model_dump(exclude_none=True, exclude={"file_id"})
             if item.url is None:
@@ -441,6 +558,8 @@ class RouterTaskBackend:
             if remote_file.file_name != item.file_name:
                 raise_api_error(502, code="invalid_upstream_response", message="Worker input order changed")
             route.state.upstream_file_id = remote_file.file_id
+            if checkpoint is not None:
+                await checkpoint()
             link = remote_file.upload
             if link is not None:
                 if upload is None:
@@ -479,8 +598,15 @@ class RouterTaskBackend:
             self._prepared_sources.clear()
             transferred = True
             return result
+        except asyncio.CancelledError:
+            task_store = getattr(self.request.app.state, "task_store", None)
+            if route is not None and task_store is not None and task_store.preserving_remote:
+                preserve_on_cancel = True
+            raise
+        except RouterProxyError as exc:
+            raise_api_error(exc.status_code, code=exc.code, message=exc.message, param=exc.param)
         finally:
-            if not transferred:
+            if not transferred and not preserve_on_cancel:
                 if upstream_id is not None and worker.generation == reservation.generation and worker.base_url:
                     await drain_future(asyncio.create_task(self._cancel_remote(worker, upstream_id)))
                 if route is not None:

@@ -90,6 +90,10 @@ class TaskBackend(Protocol):
         """提交后交接输入引用；未提交的取消或失败同时清理文件视图。"""
         ...
 
+    def close_local_pins(self) -> None:
+        """仅释放当前进程持有的本地文件租约，不撤销持久化源引用。"""
+        ...
+
     async def submit(
         self, execution_id: str, options: UploadTaskOptions, item: TaskFileItem, upload: TaskUpload | None
     ) -> TaskExecution:

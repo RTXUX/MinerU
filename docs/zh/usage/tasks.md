@@ -648,7 +648,7 @@ URL 目标必须解析为公网单播地址。worker 在连接前校验全部 IP
 HTTPS 证书校验继续读取 `SSL_CERT_FILE` / `SSL_CERT_DIR`。内网文档可以通过客户端上传。
 使用 Fake-IP 代理时，应让 worker 的 DNS 返回真实公网地址；`198.18.0.0/15` 等保留网段会被拒绝。
 对外提供解析服务时，应配置 `--api-key` 并限制 worker 的出站网络访问。
-任务记录和上传索引仍为进程内状态，重启不保证恢复。
+任务记录和上传索引默认为进程内状态，未启用 [Redis 重启恢复](router.md#redis-restart-recovery) 时重启不保证恢复。
 
 Router 按就绪文件独立选择 worker 并预占负载，同一父 Task 可使用多个 worker。
 URL 交给 worker 下载，客户端上传字节按 worker 的缓存预检结果传输。
@@ -704,7 +704,7 @@ mineru-kit router --local-gpus none \
 
 也可通过上述 POST 动态加入 Router C。建议各下层管理独立 worker 池并保持无环拓扑；本次不提供全局负载统计或跨 Router 任务接管。
 
-**动态清单仅当前进程有效。** 注册和注销不会修改启动配置；重启后恢复 `--upstream-url` 中的节点，动态节点须重新注册，worker ID 不能跨重启作为稳定标识。顶层仍有单点，任一 Router 重启后的旧任务恢复不在保证范围内。
+**未启用 Redis 持久化时，动态清单仅当前进程有效。** 注册和注销不会修改启动配置：纯内存 Router 重启后仅恢复 `--upstream-url` / `--config` 中的节点，动态节点须重新注册，旧任务恢复不在保证范围内。需要跨重启保留单活 Router 的任务、文件映射与动态 upstream 状态时，可启用 [Redis 重启恢复](router.md#redis-restart-recovery)（`--redis-url` 配合 `--local-gpus none`）。
 
 ### 协议迁移
 
