@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import anyio
 import httpx
@@ -265,6 +266,45 @@ def require_worker_generation(worker: WorkerState, generation: int) -> None:
         raise RouterProxyError(503, "upstream_unavailable", "Worker changed while the request was being submitted")
 
 
+def worker_resource_path(worker: WorkerState, url: str) -> str:
+    """提取下游返回的规范化 `/v1/...` 资源路径，兼容前置反向代理的协议终止、Host 改写与路径前缀剥离。"""
+    if not url or "?" in url or "#" in url or "\\" in url or any(ord(char) < 32 or ord(char) == 127 for char in url):
+        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource URL")
+    base = urlsplit(worker.base_url)
+    target = urlsplit(url)
+    try:
+        _ = target.port
+    except ValueError as exc:
+        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource URL") from exc
+    if target.scheme or target.netloc or url.startswith("//"):
+        if target.scheme.lower() not in {"http", "https"} or not target.hostname or target.username or target.password:
+            raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource URL")
+        raw_path = target.path
+    elif url.startswith("/"):
+        raw_path = target.path
+    else:
+        raw_path = urlsplit(urljoin(worker.base_url.rstrip("/") + "/", url)).path
+
+    def normalized_path(path: str) -> str:
+        """逐段规范化 UTF-8 与转义大小写，保留标识内部编码斜杠的路径段边界。"""
+        return "/".join(quote(unquote(segment, errors="strict"), safe="") for segment in path.split("/"))
+
+    try:
+        prefix = normalized_path(base.path).rstrip("/")
+        target_path = normalized_path(raw_path)
+    except UnicodeDecodeError as exc:
+        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource path") from exc
+
+    segments = target_path.lstrip("/").split("/") if target_path.startswith("/") else []
+    if not segments or any(segment in {"", ".", ".."} or unquote(segment) in {".", ".."} for segment in segments):
+        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource path")
+
+    resource_path = target_path[len(prefix) :] if prefix and target_path.startswith(prefix + "/") else target_path
+    if not resource_path.startswith(("/v1/tasks/", "/v1/files/")):
+        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource path")
+    return resource_path
+
+
 __all__ = [
     "RouterProxyError",
     "forwarded_headers",
@@ -275,4 +315,5 @@ __all__ = [
     "rewrite_file_payload",
     "router_error_response",
     "stream_upstream",
+    "worker_resource_path",
 ]

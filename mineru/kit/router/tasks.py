@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import replace
 from typing import Any
-from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote
 
 import httpx
 from fastapi import FastAPI, Request
@@ -40,6 +40,7 @@ from .proxy import (
     request_upstream,
     require_worker_generation,
     rewrite_file_payload,
+    worker_resource_path,
 )
 from .resources import ExecutionRoute, ResourceRegistry, SourceFileStore, utc_now_iso
 from .route_state import ExecutionRouteState
@@ -90,29 +91,11 @@ async def _worker_request(
 
 
 def _worker_path(worker: WorkerState, url: str) -> str:
-    """只接受配置 worker 自身的资源链接，禁止把私有认证或源文件转发到其他地址。"""
-    base = urlsplit(worker.base_url)
-    target = urlsplit(urljoin(worker.base_url.rstrip("/") + "/", url))
-
-    def origin(item: SplitResult) -> tuple[str, str | None, int]:
-        """按协议、主机及有效端口比较来源，端口不同也属于跨源。"""
-        return item.scheme, item.hostname, item.port or (443 if item.scheme == "https" else 80)
-
-    def normalized_path(path: str) -> str:
-        """逐段规范化 UTF-8 与转义大小写，保留标识内部编码斜杠的路径段边界。"""
-        return "/".join(quote(unquote(segment, errors="strict"), safe="") for segment in path.split("/"))
-
-    if origin(base) != origin(target) or target.username or target.password or target.query or target.fragment:
-        raise_api_error(502, code="invalid_upstream_response", message="Invalid worker resource URL")
-    # URI 转义大小写和原始 Unicode 不影响同一前缀的身份；只规范化路径，不放宽来源校验。
+    """提取校验后的下游 `/v1/...` 资源路径，请求始终发往已配置的 `worker.base_url`。"""
     try:
-        prefix = normalized_path(base.path).rstrip("/")
-        target_path = normalized_path(target.path)
-    except UnicodeDecodeError:
-        raise_api_error(502, code="invalid_upstream_response", message="Invalid worker resource path")
-    if prefix and not target_path.startswith(prefix + "/"):
-        raise_api_error(502, code="invalid_upstream_response", message="Invalid worker resource path")
-    return target_path[len(prefix) :]
+        return worker_resource_path(worker, url)
+    except RouterProxyError as exc:
+        raise_api_error(exc.status_code, code=exc.code, message=exc.message)
 
 
 def _lost_execution(route: ExecutionRoute) -> TaskExecution:

@@ -477,40 +477,45 @@ def test_dynamic_cascade_preserves_results_and_routes_new_tasks_elsewhere(tmp_pa
 
 
 @pytest.mark.parametrize(
-    ("base", "target", "expected"),
+    ("base_url", "target", "expected"),
     [
-        ("/模型", "/模型/v1/tasks/task/uploads/file", "/v1/tasks/task/uploads/file"),
+        ("http://worker/模型", "http://worker/模型/v1/tasks/task/uploads/file", "/v1/tasks/task/uploads/file"),
         (
-            "/模型",
-            "/%e6%a8%a1%e5%9e%8b/v1/tasks/task%2fpart/uploads/file%20name",
+            "http://worker/模型",
+            "http://worker/%e6%a8%a1%e5%9e%8b/v1/tasks/task%2fpart/uploads/file%20name",
             "/v1/tasks/task%2Fpart/uploads/file%20name",
         ),
-        ("/worker%20one", "/worker one/v1/files/file/content", "/v1/files/file/content"),
-        ("/50%25done", "/50%25done/v1/files/file/content", "/v1/files/file/content"),
+        ("http://worker/worker%20one", "http://worker/worker one/v1/files/file/content", "/v1/files/file/content"),
+        ("http://worker/50%25done", "http://worker/50%25done/v1/files/file/content", "/v1/files/file/content"),
+        ("http://worker/模型", "http://worker/v1/tasks/task/uploads/file", "/v1/tasks/task/uploads/file"),
+        ("https://gateway:8443/模型", "http://127.0.0.1:8000/v1/files/file/content", "/v1/files/file/content"),
+        ("https://gateway:8443/模型", "/v1/files/file/content", "/v1/files/file/content"),
     ],
 )
-def test_worker_resource_paths_normalize_equivalent_encodings(base: str, target: str, expected: str) -> None:
-    """原始 Unicode、百分号转义和大小写差异可匹配，资源 ID 内部的编码斜杠保持不变。"""
-    worker = WorkerState("worker", normalize_base_url("http://worker" + base), "remote")
-    assert _worker_path(worker, "http://worker" + target) == expected
+def test_worker_resource_paths_normalize_equivalent_encodings_and_proxies(base_url: str, target: str, expected: str) -> None:
+    """兼容编码差异及前置反向代理的协议转换、Host 改写与路径前缀剥离，保留资源 ID 内部编码斜杠。"""
+    worker = WorkerState("worker", normalize_base_url(base_url), "remote")
+    assert _worker_path(worker, target) == expected
 
 
 @pytest.mark.parametrize(
     "target",
     [
-        "http://other/模型/v1/files/file/content",
-        "http://worker:8080/模型/v1/files/file/content",
-        "https://worker/模型/v1/files/file/content",
+        "ftp://worker/v1/files/file/content",
+        "//worker/v1/files/file/content",
+        "http://worker:badport/v1/files/file/content",
         "http://user:pass@worker/模型/v1/files/file/content",
         "http://worker/模型-other/v1/files/file/content",
         "http://worker/模型%2Foutside/v1/files/file/content",
         "http://worker/模型/v1/files/file/content?token=secret",
         "http://worker/模型/v1/files/file/content#fragment",
         "http://worker/模型/%FF/v1/files/file/content",
+        "http://worker/v1/%2e%2e/admin",
+        "http://worker/模型/other/path",
     ],
 )
-def test_worker_resource_path_normalization_preserves_origin_and_prefix_checks(target: str) -> None:
-    """编码兼容不放宽同源、端口或路径前缀限制，非法 UTF-8 仍返回结构化代理错误。"""
+def test_worker_resource_path_rejects_invalid_urls_and_foreign_prefixes(target: str) -> None:
+    """代理无关模式仍拒绝凭据、查询串、片段、非法 UTF-8、路径穿越与不匹配的外部前缀。"""
     worker = WorkerState("worker", normalize_base_url("http://worker/模型"), "remote")
     with pytest.raises(ApiServerError) as error:
         _worker_path(worker, target)

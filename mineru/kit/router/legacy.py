@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import SplitResult, quote, unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote
 
 import httpx
 from fastapi import Request
@@ -36,8 +36,15 @@ from ...tasks.contracts import CreateTaskResponse, TaskDetailResponse, TaskUploa
 from ...types import MiddleJson, Tier, select_default_task_tier
 from ...utils.async_utils import drain_future, run_sync
 from ...version import __version__
-from .proxy import RouterProxyError, forwarded_headers, json_or_error, passthrough_response, request_upstream
-from .workers import JobReservation, WorkerPool, WorkerState
+from .proxy import (
+    RouterProxyError,
+    forwarded_headers,
+    json_or_error,
+    passthrough_response,
+    request_upstream,
+    worker_resource_path,
+)
+from .workers import JobReservation, WorkerPool
 
 BACKEND_TIERS: dict[str, Tier] = {
     "pipeline": "basic",
@@ -121,29 +128,6 @@ def _upload_name(filename: str | None, used_stems: set[str]) -> str:
         number += 1
     used_stems.add(candidate)
     return validate_parse_filename(f"{candidate}{suffix}")
-
-
-def _worker_resource_path(worker: WorkerState, url: str) -> str:
-    """校验下游返回的上传或产物链接属于该 worker 同源路径，防止凭据或数据外泄。"""
-    base = urlsplit(worker.base_url)
-    target = urlsplit(urljoin(worker.base_url.rstrip("/") + "/", url))
-
-    def origin(item: SplitResult) -> tuple[str, str | None, int]:
-        return item.scheme, item.hostname, item.port or (443 if item.scheme == "https" else 80)
-
-    def normalized_path(path: str) -> str:
-        return "/".join(quote(unquote(segment, errors="strict"), safe="") for segment in path.split("/"))
-
-    if origin(base) != origin(target) or target.username or target.password or target.query or target.fragment:
-        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource URL")
-    try:
-        prefix = normalized_path(base.path).rstrip("/")
-        target_path = normalized_path(target.path)
-    except UnicodeDecodeError as exc:
-        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource path") from exc
-    if prefix and not target_path.startswith(prefix + "/"):
-        raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker resource path")
-    return target_path[len(prefix) :]
 
 
 def _result_files(
@@ -249,9 +233,9 @@ class _PrivateTask:
         task_id: str,
         remote_file_id: str,
     ) -> None:
-        """向校验通过的同源上传地址流式发送单文件字节。"""
+        """向校验通过的下游资源路径流式发送单文件字节。"""
         worker = self.reservation.worker
-        resource_path = _worker_resource_path(worker, link.url)
+        resource_path = worker_resource_path(worker, link.url)
         expected_path = f"/v1/tasks/{quote(task_id, safe='')}/uploads/{quote(remote_file_id, safe='')}"
         if resource_path != expected_path:
             raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker upload path")
@@ -491,7 +475,7 @@ async def _execute_file(
 
     if not isinstance(remote_file.result_url, str) or not remote_file.result_url:
         raise RouterProxyError(502, "invalid_upstream_response", "Completed task file omitted result_url")
-    result_path = _worker_resource_path(handle.reservation.worker, remote_file.result_url)
+    result_path = worker_resource_path(handle.reservation.worker, remote_file.result_url)
     parts = result_path.strip("/").split("/")
     if len(parts) != 4 or parts[:2] != ["v1", "files"] or parts[-1] != "content" or unquote(parts[2]) != remote_file_id:
         raise RouterProxyError(502, "invalid_upstream_response", "Invalid worker result File URL")

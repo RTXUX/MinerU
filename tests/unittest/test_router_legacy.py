@@ -741,3 +741,66 @@ def test_real_v1_worker_and_cascaded_router_end_to_end(tmp_path: Path) -> None:
             assert "/file_parse" not in worker_paths
 
     asyncio.run(exercise())
+
+
+def test_proxy_agnostic_worker_behind_path_stripping_reverse_proxy(tmp_path: Path) -> None:
+    """前置网关剥离路径前缀、终止 HTTPS 并改写 Host 时，无前缀感知的真实 worker 仍可服务 `/v1/tasks` 与 `/file_parse`。"""
+
+    async def exercise() -> None:
+        worker_app = api_server.create_app(tiers=("flash",), upload_dir=str(tmp_path / "worker"))
+        worker_transport = httpx.ASGITransport(worker_app)
+        prefix = "/clusters/gpu-0"
+
+        class _PathStrippingProxy(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                assert request.url.scheme == "https"
+                assert request.url.host == "gateway.example"
+                assert request.url.port == 8443
+                assert request.url.path.startswith(prefix + "/"), f"Router must keep prefix on {request.url}"
+                stripped_path = request.url.path[len(prefix) :]
+                raw_headers = [(k, v) for k, v in request.headers.raw if k.lower() != b"host"]
+                raw_headers.append((b"host", b"127.0.0.1:8000"))
+                forwarded = httpx.Request(
+                    request.method,
+                    f"http://127.0.0.1:8000{stripped_path}",
+                    headers=raw_headers,
+                    content=await request.aread(),
+                )
+                return await worker_transport.handle_async_request(forwarded)
+
+        router = create_app(
+            RouterSettings(
+                upstream_urls=(f"https://gateway.example:8443{prefix}",),
+                local_gpus="none",
+                worker_refresh_interval_seconds=0,
+            ),
+            transport=_PathStrippingProxy(),
+        )
+        html = b"<h1>Behind path-stripping proxy</h1><p>Worker stays prefix-unaware.</p>"
+
+        async with worker_app.router.lifespan_context(worker_app), router.router.lifespan_context(router):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(router), base_url="http://router") as client:
+                # 1. Legacy /file_parse
+                legacy_res = await client.post("/file_parse", files={"files": ("doc.html", html, "text/html")})
+                assert legacy_res.status_code == 200, legacy_res.text
+                assert "Behind path-stripping proxy" in legacy_res.json()["results"]["doc"]["md_content"]
+
+                # 2. V1 /v1/tasks + upload + result download
+                created = await client.post("/v1/tasks", json={"files": [{"file_name": "task.html", "bytes": len(html)}]})
+                assert created.status_code == 202, created.text
+                task = created.json()
+                put_res = await client.put(task["files"][0]["upload"]["url"], content=html)
+                assert put_res.status_code == 200, put_res.text
+                async with asyncio.timeout(5):
+                    while True:
+                        detail = (await client.get(f"/v1/tasks/{task['task_id']}")).json()
+                        if detail["status"] in {"completed", "failed", "canceled"}:
+                            break
+                        await asyncio.sleep(0.02)
+                assert detail["status"] == "completed", detail
+                downloaded = await client.get(detail["files"][0]["result_url"])
+                assert downloaded.status_code == 200
+                with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+                    assert b"Behind path-stripping proxy" in archive.read("markdown.md")
+
+    asyncio.run(exercise())

@@ -31,7 +31,12 @@ silently refer to another server.
 
 `id` is optional; its default is a stable hash of the normalized URL. File order
 does not affect identity. URLs and IDs must be unique across file entries,
-repeatable `--upstream-url` options, and dynamically registered workers. CLI
+repeatable `--upstream-url` options, and dynamically registered workers. Upstream
+base URLs may include reverse-proxy path prefixes (for example
+`https://proxy.example.com/worker-1`); workers need not be configured with
+`root_path` or `X-Forwarded-*` headers, as the router extracts the canonical
+`/v1/...` resource path and always connects via the configured upstream base
+URL. CLI
 `--upstream-url` entries and [Admin API](tasks.md#dynamic-router-upstreams-and-cascading)
 workers (`/v1/router/workers`) remain untouched across `SIGHUP` reloads. An empty
 `upstreams: []` drains all file-configured upstreams. `SIGHUP` reloads YAML
